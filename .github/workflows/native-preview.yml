@@ -3,6 +3,14 @@ name: Build exact encrypted native preview
 on:
   workflow_dispatch:
     inputs:
+      target:
+        description: Build all native targets or only the iOS simulator
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - ios
       source_commit:
         description: Exact private Apps commit
         required: true
@@ -40,9 +48,22 @@ env:
   ANYMIZE_DESKTOP_CHANNEL: preview
 
 jobs:
+  validate-target:
+    name: Validate explicit native target
+    if: github.repository == 'anymize-GmbH/downloads' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    env:
+      NATIVE_BUILD_TARGET: ${{ inputs.target }}
+    steps:
+      - name: Reject missing or unsupported target without source credentials
+        run: |
+          node --input-type=module -e "if (!['all', 'ios'].includes(process.env.NATIVE_BUILD_TARGET)) { process.stderr.write('Invalid native build target.\n'); process.exit(1); }"
+
   desktop:
     name: Actual desktop ${{ matrix.id }} installer
-    if: github.repository == 'anymize-GmbH/downloads' && github.ref == 'refs/heads/main'
+    needs: validate-target
+    if: github.repository == 'anymize-GmbH/downloads' && github.ref == 'refs/heads/main' && inputs.target == 'all'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 50
     strategy:
@@ -113,7 +134,8 @@ jobs:
 
   ios-simulator:
     name: Actual iOS Release simulator build and launch
-    if: github.repository == 'anymize-GmbH/downloads' && github.ref == 'refs/heads/main'
+    needs: validate-target
+    if: github.repository == 'anymize-GmbH/downloads' && github.ref == 'refs/heads/main' && (inputs.target == 'all' || inputs.target == 'ios')
     runs-on: macos-26
     timeout-minutes: 90
     env:
@@ -139,11 +161,25 @@ jobs:
       - run: node scripts/run-private.mjs install
       - run: node scripts/run-private.mjs check
       - name: Compile and integrity-seal simulator application
+        id: compile_ios
         run: node scripts/run-private.mjs ios
+      - name: Preserve integrity-verified iOS archive without claiming runtime acceptance
+        if: success() && steps.compile_ios.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: preview-ios-simulator-compile-only-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            private-input/source/artifacts/ios-simulator/anymize-ios-simulator.app.tar.gz
+            private-input/source/artifacts/ios-simulator/build-info.json
+            private-input/source/artifacts/ios-simulator/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
       - name: Install, launch and relaunch on real ephemeral iOS simulator
+        id: runtime_ios
         run: node scripts/run-private.mjs ios-smoke
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: success()
+      - name: Preserve runtime-verified iOS simulator and launch evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: success() && steps.compile_ios.outcome == 'success' && steps.runtime_ios.outcome == 'success'
         with:
           name: preview-ios-simulator-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -154,6 +190,14 @@ jobs:
             private-input/source/artifacts/ios-simulator-smoke/*.png
           if-no-files-found: error
           retention-days: 14
+      - name: Preserve selected-simulator OS context without claiming app success
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: failure()
+        with:
+          name: preview-ios-os-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: private-input/source/artifacts/ios-simulator-smoke/os-before-launch.png
+          if-no-files-found: warn
+          retention-days: 7
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: failure()
         with:
@@ -164,7 +208,8 @@ jobs:
 
   android:
     name: Standalone Android APK
-    if: github.repository == 'anymize-GmbH/downloads' && github.ref == 'refs/heads/main'
+    needs: validate-target
+    if: github.repository == 'anymize-GmbH/downloads' && github.ref == 'refs/heads/main' && inputs.target == 'all'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
