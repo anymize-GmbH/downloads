@@ -1,0 +1,77 @@
+name: Android operating-system baseline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: emulator-baseline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  emulator:
+    name: Android API ${{ matrix.api }} fresh accelerated OS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - api: '35'
+            sdk: '35'
+            image: google_apis
+            pages: '4096'
+          - api: '36'
+            sdk: '36'
+            image: google_apis_ps16k
+            pages: '16384'
+          - api: '37'
+            sdk: '37.0'
+            image: google_apis_ps16k
+            pages: '16384'
+    env:
+      EXPECTED_API: ${{ matrix.api }}
+      EXPECTED_PAGE_SIZE: ${{ matrix.pages }}
+      EXPECTED_IMAGE: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.23.2'
+      - name: Record actual host and enable disposable KVM access
+        run: |
+          mkdir -p artifacts/baseline
+          lscpu > artifacts/baseline/host-cpu.txt
+          free -b > artifacts/baseline/host-memory.txt
+          df -k > artifacts/baseline/host-disk.txt
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+          "$ANDROID_HOME/emulator/emulator" -accel-check > artifacts/baseline/host-acceleration.txt 2>&1
+      - name: Boot and verify a real complete Android image
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: ${{ matrix.sdk }}
+          target: ${{ matrix.image }}
+          arch: x86_64
+          profile: pixel
+          force-avd-creation: true
+          disk-size: '8G'
+          ram-size: '4096M'
+          cores: 4
+          emulator-boot-timeout: 900
+          disable-linux-hw-accel: false
+          disable-animations: false
+          emulator-options: -no-window -gpu swiftshader -accel on -no-snapshot -noaudio -camera-back none
+          script: node scripts/emulator-baseline.mjs
+      - name: Preserve actual OS receipts and pixels on success or failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: android-os-api${{ matrix.api }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/baseline/
+          if-no-files-found: error
+          retention-days: 14
