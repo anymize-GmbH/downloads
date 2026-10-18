@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createCipheriv, createHash, randomBytes } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { openInputEnvelope, inputAad, assertInputArchive, readBoundMetadata } from './input-envelope.mjs';
 import { sourceInputFailure } from './fetch-build-input.mjs';
 
@@ -20,6 +24,31 @@ test('public fetch diagnostics identify only fixed stages and bounded HTTP categ
     const output = sourceInputFailure(stage, { stderr: privateText, message: privateText });
     assert.equal(output, 'Source input rejected [internal:rejected].\n');
     assert.equal(output.includes(privateText), false);
+  }
+});
+
+test('actual fetch entry fails closed without raw errors and never deletes a pre-existing extraction archive', () => {
+  const parent = resolve('.unlazy/input-envelope-fixtures');
+  mkdirSync(parent, { recursive: true });
+  const scratch = mkdtempSync(join(parent, 'entry-'));
+  const script = fileURLToPath(new URL('./fetch-build-input.mjs', import.meta.url));
+  const system = process.platform === 'win32' ? { SystemRoot: process.env.SystemRoot } : {};
+  const invoke = (env) => spawnSync(process.execPath, [script], { cwd: scratch, env: { ...system, ...env }, encoding: 'utf8', timeout: 10000 });
+  try {
+    const invalid = invoke({ BUILD_INPUT_DECRYPTION_KEY: 'SYNTHETIC_SECRET_NEVER_LOG' });
+    assert.equal(invalid.status, 1); assert.equal(invalid.stdout, '');
+    assert.equal(invalid.stderr, 'Source input rejected [identity:rejected].\n');
+    mkdirSync(join(scratch, 'private-input'));
+    const sentinel = join(scratch, 'private-input/source.tgz'); writeFileSync(sentinel, 'existing caller-owned archive');
+    const existing = invoke({ GITHUB_REPOSITORY: 'anymize-GmbH/downloads', GITHUB_SHA: 'a'.repeat(40), GITHUB_RUN_ID: '1', GITHUB_RUN_ATTEMPT: '1',
+      ANYMIZE_EXPECTED_SOURCE_COMMIT: 'b'.repeat(40), BUILD_INPUT_ASSET_ID: '1', BUILD_INPUT_METADATA_ID: '2', BUILD_INPUT_SHA256: 'a'.repeat(64),
+      BUILD_INPUT_METADATA_SHA256: 'b'.repeat(64), BUILD_INPUT_DECRYPTION_KEY: 'a'.repeat(43), GH_TOKEN: 'synthetic-not-a-real-token' });
+    assert.equal(existing.status, 1); assert.equal(existing.stdout, '');
+    assert.equal(existing.stderr, 'Source input rejected [target:rejected].\n');
+    assert.equal(readFileSync(sentinel, 'utf8'), 'existing caller-owned archive');
+  } finally {
+    assert.ok(resolve(scratch).startsWith(parent + sep));
+    rmSync(scratch, { recursive: true, force: true });
   }
 });
 
