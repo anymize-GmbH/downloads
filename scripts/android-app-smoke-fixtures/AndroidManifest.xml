@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="ai.anymize.smokefixture" android:versionCode="1" android:versionName="1.0">
+  <uses-sdk android:minSdkVersion="35" android:targetSdkVersion="35" />
+  <queries><package android:name="ai.anymize.mobile" /></queries>
+  <application android:label="Synthetic PDF fixture" android:debuggable="true" android:testOnly="true" android:allowBackup="false" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+    <activity android:name=".GrantActivity" android:exported="true" />
+    <provider android:name=".FixtureProvider" android:authorities="ai.anymize.smokefixture.pdf" android:exported="false" android:grantUriPermissions="true" />
+  </application>
+</manifest>
