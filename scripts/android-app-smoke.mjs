@@ -226,6 +226,17 @@ export function validateInstalledPackage(text, info) {
   assert(versions.length === 1 && Number(versions[0][1]) === info.versionCode && names.length === 1 && names[0][1].trim() === info.versionName && !/\bDEBUGGABLE\b/.test(text), 'Installed app version or release debug policy differs.');
 }
 
+export function launcherComponent(badging) {
+  const entries = [...badging.matchAll(/^launchable-activity: name='([^']+)'/gm)];
+  assert(entries.length === 1 && entries[0][1] === `${APP}.MainActivity`, 'Exact APK must expose its normal launcher activity.');
+  return `${APP}/.MainActivity`;
+}
+
+export function validateLauncherStart(text) {
+  assert(/^Status: ok\s*$/m.test(text) && !/^Error:|^Status: (?!ok)/m.test(text), 'Actual launcher activity did not start successfully.');
+  return text;
+}
+
 export function installedApkPath(text) {
   assert(typeof text === 'string' && text.split(/\r?\n/).length === 1 && /^package:\/data\/app\/[A-Za-z0-9_~\-/+=.]+\/base\.apk$/.test(text) && !text.includes('/../'), 'Actual standalone installed APK path unavailable.');
   return text.slice(8);
@@ -340,6 +351,14 @@ export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT
   mkdirSync(root, { recursive: true }); const files = []; const stages = []; let sequence = 0;
   const adb = (args, timeout = 30000) => execute('adb', ['-s', 'emulator-5554', ...args], { timeout, maxBuffer: 20 * 1024 ** 2, stdio: ['ignore', 'pipe', 'pipe'] });
   const shell = (...args) => adb(['shell', ...args]).toString('utf8').trim();
+  // Launchers resolve MAIN/LAUNCHER and then use an explicit component. A plain
+  // am start -p is implicit and also requires CATEGORY_DEFAULT, which launcher
+  // filters intentionally lack. Keep the binary's launcher check compulsory.
+  let mainComponent;
+  const launchMain = () => {
+    assert(mainComponent, 'Verified APK launcher required before starting.');
+    return validateLauncherStart(shell('am','start','-W','-a','android.intent.action.MAIN','-c','android.intent.category.LAUNCHER','-n',mainComponent));
+  };
   const store = (name, bytes) => { const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes); writeFileSync(join(root, name), buffer); files.push({ name, bytes: buffer.length, sha256: sha(buffer) }); return buffer; };
   const health = () => {
     const events = shell('logcat', '-b', 'events', '-d', '-v', 'threadtime'); const system = shell('logcat', '-b', 'system', '-d', '-v', 'threadtime'); const runtime = shell('logcat', '-b', 'crash', '-d', '-v', 'threadtime');
@@ -396,7 +415,7 @@ export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT
     store('native-edge-warm-b-launch.txt',grant('second'));
     await waitText('anymize-smoke-second.pdf',{scroll:true});await searchFor(SECOND_PHRASE);await render('native-edge-warm-b','horizontal',false);
     shell('input','keyevent','KEYCODE_HOME');await pause(1000);
-    store('native-edge-foreground-launch.txt',shell('am','start','-W','-a','android.intent.action.MAIN','-c','android.intent.category.LAUNCHER','-p',APP));
+    store('native-edge-foreground-launch.txt',launchMain());
     await waitText('anymize-smoke-second.pdf',{scroll:true});await searchFor(SECOND_PHRASE);await render('native-edge-foreground-b','horizontal',false);
     const foregroundPid=shell('pidof',APP);assert(foregroundPid===coldPid,'Foreground test changed the app process instead of testing live intent replay.');
     await tap('Workspace',{scroll:true});await find('anymize-smoke-fixture.pdf',{scroll:true});
@@ -425,6 +444,7 @@ export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT
     assert(signingCertificate(signature) === info.signingCertificateSha256, 'Actual selected APK signing certificate differs.'); store('apk-signature.txt', signature);
     const badging = execute(join(tools, 'aapt2'), ['dump', 'badging', apkPath], { timeout: 30000, maxBuffer: 1048576 }).toString('utf8');
     assert(badging.includes(`package: name='${APP}' versionCode='${info.versionCode}' versionName='${info.versionName}'`) && !/^application-debuggable\b/m.test(badging), 'Selected APK release package metadata or debug flag differs.'); store('apk-badging.txt', badging);
+    mainComponent = launcherComponent(badging);
     store('app-install.txt', adb(['install', '--no-streaming', apkPath], 120000));
     store('helper-install.txt', adb(['install', '-t', resolve(root, 'synthetic-fixture.apk')], 120000));
     const installed = shell('dumpsys', 'package', APP); validateInstalledPackage(installed, info); store('installed-package.txt', installed);
@@ -433,7 +453,7 @@ export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT
     const installedCopy = resolve(root, 'installed-base.apk'); adb(['pull', deviceApkPath, installedCopy], 120000); assert(sha(regular(installedCopy, 512 * 1024 ** 2)) === identity.apkSha256, 'Installed device APK bytes differ from immutable asset.');
     // Keep artifact uploads to allowlisted evidence; a second installer copy is unnecessary.
     store('installed-apk-identity.json', JSON.stringify({ sha256: identity.apkSha256, bytes: info.apkBytes, uid: Number(uidMatch[1]) }, null, 2));
-    shell('am', 'start', '-W', '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER', '-p', APP);
+    store('initial-launch.txt',launchMain());
     await waitText('Your workspace', { timeout: 120000 }); capture('01-local-hub');
     const firstPid = shell('pidof', APP); assert(/^[1-9]\d*$/.test(firstPid), 'Actual app PID missing.'); store('app-pid-before.txt', firstPid);
     const sockets = shell('cat', '/proc/net/unix'); assert(!new RegExp(`webview_devtools_remote_${firstPid}(?:\\s|$)`).test(sockets), 'Release WebView debugging socket unexpectedly exposed.'); store('release-webview-debugging.json', JSON.stringify({ appPid: firstPid, devtoolsSocketForApp: false }));

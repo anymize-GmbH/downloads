@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { APP, HELPER, REPOSITORY, PHRASE, SECOND_PHRASE, strictJson, inputIdentity, validateBuildInfo, validateAsset, fetchInput, fixturePdf, inspectSavedPdf, pngCrc, decodePng, pdfMarkers, uiNodes, selectNode, validateNativeSignIn, validateInstalledPackage, installedApkPath, signingCertificate, validateFixtureBadging, buildFixture, validateNativeEdges, assertRuntimeHealthy, runSmoke } from './android-app-smoke.mjs';
+import { APP, HELPER, REPOSITORY, PHRASE, SECOND_PHRASE, strictJson, inputIdentity, validateBuildInfo, validateAsset, fetchInput, fixturePdf, inspectSavedPdf, pngCrc, decodePng, pdfMarkers, uiNodes, selectNode, validateNativeSignIn, validateInstalledPackage, launcherComponent, validateLauncherStart, installedApkPath, signingCertificate, validateFixtureBadging, buildFixture, validateNativeEdges, assertRuntimeHealthy, runSmoke } from './android-app-smoke.mjs';
 
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const apk = Buffer.alloc(1024 * 1024, 23); apk.set([80,75,3,4]);
@@ -150,6 +150,13 @@ test('native sign-in requires its actual enabled first-party control and rejects
   assert.throws(() => validateNativeSignIn([button,{...button,rect:[10,200,400,260]}]), /Ambiguous/);
 });
 
+test('launcher start uses an independently verified normal APK entry and rejects unresolved or timed-out launches', () => {
+  assert.equal(launcherComponent(`launchable-activity: name='${APP}.MainActivity' label='anymize' icon=''\n`),`${APP}/.MainActivity`);
+  for(const value of ['',`launchable-activity: name='evil.app.MainActivity'\n`,`launchable-activity: name='${APP}.MainActivity'\nlaunchable-activity: name='${APP}.Other'\n`])assert.throws(()=>launcherComponent(value));
+  assert.equal(validateLauncherStart('Status: ok\nActivity: ai.anymize.mobile/.MainActivity'),'Status: ok\nActivity: ai.anymize.mobile/.MainActivity');
+  for(const value of ['Status: timeout','Error: Activity not started','Status: ok\nError: unable to resolve Intent','Starting: Intent {...}'])assert.throws(()=>validateLauncherStart(value));
+});
+
 test('installed release metadata rejects mismatched version or native debug flag', () => {
   const installed='  versionCode=2 minSdk=24 targetSdk=36\n  versionName=0.2.0\n  flags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ]';
   validateInstalledPackage(installed,info);
@@ -252,7 +259,7 @@ function simulatedDevice({ anrAfterRotate=false, wrongInstalledApk=false, replay
   const execute=(file,args)=>{
     model.clock+=20;model.calls.push([file,[...args]]);
     if(file.endsWith('apksigner'))return Buffer.from(`Number of signers: 1\nV3.0 Signer: certificate SHA-256 digest: ${info.signingCertificateSha256}\n`);
-    if(file.endsWith('aapt2'))return Buffer.from(`package: name='${APP}' versionCode='2' versionName='0.2.0'\n`);
+    if(file.endsWith('aapt2'))return Buffer.from(`package: name='${APP}' versionCode='2' versionName='0.2.0'\nlaunchable-activity: name='${APP}.MainActivity' label='anymize' icon=''\n`);
     assert.equal(file,'adb');assert.deepEqual(args.slice(0,2),['-s','emulator-5554']);const call=args.slice(2);
     if(call[0]==='install')return Buffer.from('Success');
     if(call[0]==='exec-out')return model.mode==='viewer'||model.mode==='saved'?model.rotated?pngVertical:pngHorizontal:blank;
@@ -274,6 +281,7 @@ function simulatedDevice({ anrAfterRotate=false, wrongInstalledApk=false, replay
     if(cmd[0]==='am'&&cmd[1]==='force-stop'){model.running=false;model.forceStops++;model.documents.clear();model.query='';model.searched=false;return Buffer.from('');}
     if(cmd[0]==='ps')return Buffer.from(model.running?`PID NAME\n4321 ${APP}`:'PID NAME\n555 ai.anymize.smokefixture');
     if(cmd[0]==='am'&&cmd[1]==='start'){
+      if(cmd.includes('android.intent.action.MAIN')){assert.ok(cmd.includes('-n'));assert.equal(cmd.at(-1),`${APP}/.MainActivity`);assert.ok(!cmd.includes('-p'));}
       if(cmd.includes('fixture')){
         assert.ok(model.offlineReads>=2);model.grantWhileOffline++;const kind=cmd.at(-1);
         if(kind==='stall'){model.stalledAt=model.clock;model.stalledOnce=true;}
