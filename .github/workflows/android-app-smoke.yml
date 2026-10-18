@@ -2,6 +2,7 @@ name: Android current APK blackbox smoke
 
 on:
   push:
+    branches: [main]
     paths:
       - .github/workflows/android-app-smoke.yml
       - scripts/android-app-smoke.mjs

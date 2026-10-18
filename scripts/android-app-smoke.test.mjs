@@ -178,7 +178,7 @@ test('workflow preserves exact verified OS setup, immutable inputs and safe evid
 test('push source compilation is independent, token-free and cannot start emulator jobs', () => {
   const workflow=readFileSync(new URL('../.github/workflows/android-app-smoke.yml',import.meta.url),'utf8');
   const compile=workflow.split('  source-compile:')[1].split('  app-smoke:')[0];const runtime=workflow.split('  app-smoke:')[1];
-  assert.match(workflow,/push:\s*\n\s*paths:/);assert.match(compile,/permissions: \{\}/);assert.match(compile,/https:\/\/github.com\/anymize-GmbH\/downloads\.git "\$GITHUB_SHA"/);assert.match(compile,/--compile-helper/);
+  assert.match(workflow,/push:\s*\n\s*branches: \[main\]\s*\n\s*paths:/);assert.match(compile,/permissions: \{\}/);assert.match(compile,/https:\/\/github.com\/anymize-GmbH\/downloads\.git "\$GITHUB_SHA"/);assert.match(compile,/--compile-helper/);
   for(const forbidden of ['secrets.','github.token','GH_TOKEN','inputs.','APK_ASSET_ID','emulator-runner','--fetch'])assert.ok(!compile.includes(forbidden));
   assert.match(runtime,/if: github\.event_name == 'workflow_dispatch'/);assert.match(runtime,/needs: source-compile/);
 });
