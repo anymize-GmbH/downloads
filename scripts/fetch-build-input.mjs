@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash, createPublicKey } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, openSync, closeSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openInputEnvelope, assertInputArchive, readBoundMetadata } from './input-envelope.mjs';
@@ -27,7 +27,7 @@ export function sourceInputFailure(stage, error) {
 
 export function fetchBuildInput(env = process.env) {
 let stage = 'identity';
-let ownsRoot = false;
+let ownsPlainFile = false;
 const root = resolve('private-input');
 const plainFile = join(root, 'source.tgz');
 try {
@@ -48,7 +48,6 @@ if (!['anymize-GmbH/anymize-apps', 'attractsoft/anychat'].includes(sourceReposit
 stage = 'target';
 if (existsSync(root)) throw new Error('Source extraction target must be fresh');
 mkdirSync(root);
-ownsRoot = true;
 const hash = (buffer) => createHash('sha256').update(buffer).digest('hex');
 const download = (id, maxBuffer) => execFileSync('gh', ['api', '-H', 'Accept: application/octet-stream', `repos/${repository}/releases/assets/${id}`], { maxBuffer, timeout: 600000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   stage = 'metadata-download';
@@ -66,7 +65,9 @@ const download = (id, maxBuffer) => execFileSync('gh', ['api', '-H', 'Accept: ap
   stage = 'envelope-authentication';
   const plaintext = openInputEnvelope(encrypted, metadata, commit, expectedEncryptedSha, keyText, sourceRepository);
   stage = 'archive-write';
-  writeFileSync(plainFile, plaintext, { mode: 0o600, flag: 'wx' });
+  const archive = openSync(plainFile, 'wx', 0o600);
+  ownsPlainFile = true;
+  try { writeFileSync(archive, plaintext); } finally { closeSync(archive); }
   stage = 'archive-list';
   const paths = execFileSync('tar', ['-tzf', plainFile], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim().split(/\r?\n/);
   const types = execFileSync('tar', ['-tvzf', plainFile], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim().split(/\r?\n/);
@@ -94,7 +95,7 @@ const download = (id, maxBuffer) => execFileSync('gh', ['api', '-H', 'Accept: ap
   // Never expose private tar paths/source/error payload or key through public logs.
   process.stderr.write(sourceInputFailure(stage, error)); process.exitCode = 1;
 } finally {
-  try { if (ownsRoot && existsSync(plainFile)) rmSync(plainFile); }
+  try { if (ownsPlainFile && existsSync(plainFile)) rmSync(plainFile); }
   catch { process.stderr.write('Source input cleanup rejected.\n'); process.exitCode = 1; }
 }
 }
