@@ -82,9 +82,10 @@ jobs:
           disable-linux-hw-accel: false
           disable-animations: false
           # Preserve complete images and actual page sizes. This smaller
-          # framebuffer and skipped boot animation reduce first-boot CPU load.
+          # framebuffer reduces first-boot CPU rasterization load.
           # These receipts prove OS readiness, not Pixel hardware/app acceptance.
-          emulator-options: -no-window -gpu swiftshader -accel on -no-snapshot -noaudio -camera-back none -no-boot-anim -no-metrics -skin 720x1280 -dpi-device 320
+          # Keep boot animation enabled so its actual stopped state is observed.
+          emulator-options: -no-window -gpu swiftshader -accel on -no-snapshot -noaudio -camera-back none -no-metrics -skin 720x1280 -dpi-device 320
           script: node scripts/emulator-baseline.mjs
       - name: Preserve actual OS receipts and pixels on success or failure
         if: always()

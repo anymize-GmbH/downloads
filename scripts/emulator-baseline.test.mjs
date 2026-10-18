@@ -86,7 +86,7 @@ test('launcher on another display and stale background launcher strings do not c
 });
 
 test('boot, animation and a single live SystemUI PID remain hard conditions', () => {
-  for (const patch of [{ boot: '0' }, { boot: '' }, { animation: 'running' }, { pid: '' }, { pid: '1017 2117' }, { pid: '0' }, { pid: 'dead' }, { surfacePid: '' }, { surfacePid: '1747 2747' }]) assert.equal(assessBootSample(good(patch)).healthy, false);
+  for (const patch of [{ boot: '0' }, { boot: '' }, { animation: 'running' }, { animation: '' }, { pid: '' }, { pid: '1017 2117' }, { pid: '0' }, { pid: 'dead' }, { surfacePid: '' }, { surfacePid: '1747 2747' }]) assert.equal(assessBootSample(good(patch)).healthy, false);
 });
 
 test('actual API 37 launcher and SystemUI ANR signatures remain fatal', () => {
@@ -269,7 +269,7 @@ test('workflow preserves full official images, acceleration, page-size identity 
   assert.match(workflow, /ram-size: '6144M'/);
   assert.match(workflow, /-accel on/);
   assert.match(workflow, /-no-snapshot/);
-  assert.match(workflow, /-no-boot-anim/);
+  assert.doesNotMatch(workflow, /-no-boot-anim/);
   assert.match(workflow, /-skin 720x1280 -dpi-device 320/);
   assert.match(workflow, /node --test scripts\/emulator-baseline\.test\.mjs/);
   assert.match(workflow, /node scripts\/emulator-baseline\.mjs --pin-command-tools/);
