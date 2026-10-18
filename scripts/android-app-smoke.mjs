@@ -343,7 +343,10 @@ export function buildFixture({ env = process.env, output = OUTPUT, execute = exe
   }
 }
 
-export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT, baselineRoot = 'artifacts/baseline', execute = execFileSync, now = Date.now, pause = sleep, output = (text) => process.stdout.write(text) } = {}) {
+/** Historical free-PDF orchestration retained for regression simulations only.
+ * The CLI and new publication contract exclusively use the paid-entry check. */
+export async function runLegacyPdfSmoke({ env = process.env, input = INPUT, root = OUTPUT, baselineRoot = 'artifacts/baseline', execute = execFileSync, now = Date.now, pause = sleep, output = (text) => process.stdout.write(text) } = {}) {
+  assert(execute !== execFileSync, 'Historical free-PDF harness is disabled for real execution; use the current paid-entry smoke.');
   const os = runner(env); const identity = inputIdentity(env);
   const info = validateBuildInfo(regular(join(input, 'build-info.json'), MAX_JSON_BYTES), identity);
   const apkPath = resolve(input, ASSET_NAME); const apk = regular(apkPath, 512 * 1024 ** 2);
@@ -518,6 +521,109 @@ export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT
   } catch (error) {
     const diagnosticErrors = [];
     for (const [name, args] of [['failure-events.txt', ['shell','logcat','-b','events','-d']], ['failure-system.txt', ['shell','logcat','-b','system','-d']], ['failure-crash.txt', ['shell','logcat','-b','crash','-d']], ['failure-runtime.txt', ['shell','logcat','-b','main','-d','-t','200','-s','ReactNativeJS:E','AndroidRuntime:E','Expo:E']], ['failure-activity.txt', ['shell','dumpsys','activity','activities']], ['failure-window.txt', ['shell','dumpsys','window','displays']], ['failure.png', ['exec-out','screencap','-p']]]) {
+      try { store(name, adb(args, 15000)); } catch (diagnostic) { diagnosticErrors.push({ name, message: String(diagnostic.message).slice(0, 2000) }); }
+    }
+    try { store('failure.xml', dump().xml); } catch (diagnostic) { diagnosticErrors.push({ name: 'failure.xml', message: String(diagnostic.message).slice(0, 2000) }); }
+    store('failure.json', JSON.stringify({ schemaVersion: 1, status: 'failed', ...os, identity, stages, message: String(error.message).slice(0, 4000), diagnosticErrors, files: [...files] }, null, 2)); throw error;
+  }
+}
+
+export function validatePaidEntry(nodes) {
+  const entry = validateNativeSignIn(nodes);
+  assert(!nodes.some((node) => node.package === APP && (/WebView|EditText/.test(node.class ?? '')
+    || (node.enabled === 'true' && node.clickable === 'true' && /^(?:Chat|Co-Workspace|Open PDF|Save a copy|Rotate page|Workspace|Your workspace)$/.test(node.text ?? ''))
+    || /^(?:anymize-smoke-(?:fixture|second|stall|saved)\.pdf|Page 1:)/.test(node.text ?? ''))), 'Anonymous suite tool or document content is accessible.');
+  return entry;
+}
+export function providerOpenCount(value) {
+  assert(typeof value === 'string' && value.length <= 4096, 'Invalid synthetic provider witness.');
+  const lines = value.trim().split(/\r?\n/);
+  assert(lines.length >= 1 && lines.every((line) => /^open:\/(?:original|second|stall|saved)$/.test(line)), 'Missing or malformed positive provider witness.');
+  return lines.length;
+}
+
+/** Real unchanged production APK, real OS UI/URI grants, no account or paid bypass.
+ * This establishes anonymous denial only; it never certifies paid tool use. */
+export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT, baselineRoot = 'artifacts/baseline', execute = execFileSync, now = Date.now, pause = sleep, output = (text) => process.stdout.write(text) } = {}) {
+  const os = runner(env); const identity = inputIdentity(env);
+  const info = validateBuildInfo(regular(join(input, 'build-info.json'), MAX_JSON_BYTES), identity);
+  const apkPath = resolve(input, ASSET_NAME); const apk = regular(apkPath, 512 * 1024 ** 2);
+  assert(apk.length === info.apkBytes && sha(apk) === identity.apkSha256, 'Local selected APK differs.');
+  mkdirSync(root, { recursive: true }); const files = []; const stages = []; let sequence = 0;
+  const adb = (args, timeout = 30000) => execute('adb', ['-s', 'emulator-5554', ...args], { timeout, maxBuffer: 20 * 1024 ** 2, stdio: ['ignore', 'pipe', 'pipe'] });
+  const shell = (...args) => adb(['shell', ...args]).toString('utf8').trim();
+  const store = (name, value) => { const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value); writeFileSync(join(root, name), bytes); files.push({ name, bytes: bytes.length, sha256: sha(bytes) }); };
+  const health = () => { const result = {}; for (const buffer of ['events', 'system', 'crash']) result[buffer] = shell('logcat', '-b', buffer, '-d', '-v', 'threadtime'); assertRuntimeHealthy(result.events, result.system, result.crash); return result; };
+  const focused = () => { const value = shell('dumpsys', 'activity', 'activities'); assert(value.split(/\r?\n/).some((line) => /\b(?:mResumedActivity|topResumedActivity)\b/.test(line) && line.includes(`${APP}/`)), 'Actual application is not resumed.'); return value; };
+  const dump = () => {
+    shell('rm', '-f', '/sdcard/anymize-app-smoke.xml');
+    const value = shell('uiautomator', 'dump', '/sdcard/anymize-app-smoke.xml');
+    if (!/UI hier(?:archy|chary) dumped to: \/sdcard\/anymize-app-smoke\.xml\s*$/.test(value) || /ERROR:/i.test(value)) { store(`ui-not-ready-${++sequence}.txt`, value); const error = new Error('Actual UI hierarchy is not ready'); error.code = 'UI_NOT_READY'; throw error; }
+    const xml = shell('cat', '/sdcard/anymize-app-smoke.xml'); return { xml, nodes: uiNodes(xml) };
+  };
+  const entry = async (name) => {
+    const until = now() + 120000;
+    while (now() < until) {
+      health(); let tree;
+      try { tree = dump(); } catch (error) { if (error.code !== 'UI_NOT_READY') throw error; await pause(1000); continue; }
+      // A visible product tool is always a failure, including while waiting for sign-in.
+      assert(!tree.nodes.some((node) => node.package === APP && /^(?:Save a copy|Rotate page|Unchanged file|anymize-smoke-(?:fixture|second)\.pdf)$/.test(node.text ?? '')), 'Anonymous PDF tool or content is accessible.');
+      if (selectNode(tree.nodes, 'Sign in with anymize')) {
+        const proof = validatePaidEntry(tree.nodes); focused();
+        const png = adb(['exec-out', 'screencap', '-p']); decodePng(png);
+        store(`${name}.xml`, tree.xml); store(`${name}.png`, png); stages.push({ name, at: new Date(now()).toISOString() }); return proof;
+      }
+      await pause(1000);
+    }
+    throw new Error('Actual enabled native paid sign-in entry unavailable.');
+  };
+  const witness = () => providerOpenCount(shell('run-as', HELPER, 'cat', 'files/provider-opens.log'));
+  const assertUnread = (name) => { const count = witness(); store(`${name}-provider.json`, JSON.stringify({ positiveControlOpens: 1, actualOpens: count, anonymousAdditionalOpens: count - 1 })); assert(count === 1, 'Anonymous app read the granted synthetic PDF.'); };
+  const grant = (kind) => shell('am', 'start', '-W', '-n', `${HELPER}/.GrantActivity`, '--es', 'fixture', kind);
+  try {
+    const baseline = strictJson(regular(join(baselineRoot, 'result.json'), MAX_JSON_BYTES).toString('utf8'));
+    assert(baseline.status === 'passed' && baseline.scope === 'real-emulator-os-only-no-app-acceptance' && baseline.commit === env.GITHUB_SHA && baseline.runId === env.GITHUB_RUN_ID && baseline.api === os.api && baseline.pageSize === os.pageSize, 'Fresh unchanged OS baseline must pass in this exact job before app acceptance.');
+    store('selected-build-info.json', regular(join(input, 'build-info.json'), MAX_JSON_BYTES)); store('selected-input.json', JSON.stringify(identity));
+    const tools = join(env.ANDROID_HOME, 'build-tools', '37.0.0');
+    const signature = execute(join(tools, 'apksigner'), ['verify', '--verbose', '--print-certs', apkPath], { timeout: 30000, maxBuffer: 1048576 }).toString('utf8');
+    assert(signingCertificate(signature) === info.signingCertificateSha256, 'Actual selected APK signing certificate differs.'); store('apk-signature.txt', signature);
+    const badging = execute(join(tools, 'aapt2'), ['dump', 'badging', apkPath], { timeout: 30000, maxBuffer: 1048576 }).toString('utf8');
+    assert(badging.includes(`package: name='${APP}' versionCode='${info.versionCode}' versionName='${info.versionName}'`) && !/^application-debuggable\b/m.test(badging), 'Selected APK release package metadata or debug flag differs.'); store('apk-badging.txt', badging);
+    const component = launcherComponent(badging);
+    const launch = () => validateLauncherStart(shell('am', 'start', '-W', '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER', '-n', component));
+    store('app-install.txt', adb(['install', '--no-streaming', apkPath], 120000)); store('helper-install.txt', adb(['install', '-t', resolve(root, 'synthetic-fixture.apk')], 120000));
+    const installed = shell('dumpsys', 'package', APP); validateInstalledPackage(installed, info); store('installed-package.txt', installed);
+    const uidOutput = shell('pm', 'list', 'packages', '-U', APP); const uidMatch = new RegExp(`^package:${APP.replaceAll('.', '\\.')} uid:([1-9]\\d*)$`).exec(uidOutput); assert(uidMatch && Number(uidMatch[1]) >= 10000, 'Actual installed app UID missing.'); store('installed-uid.txt', uidOutput);
+    const pathOutput = shell('pm', 'path', APP); const deviceApk = installedApkPath(pathOutput); store('installed-path.txt', pathOutput);
+    const installedCopy = resolve(root, 'installed-base.apk'); adb(['pull', deviceApk, installedCopy], 120000); assert(sha(regular(installedCopy, 512 * 1024 ** 2)) === identity.apkSha256, 'Installed device APK bytes differ from immutable asset.');
+    store('installed-apk-identity.json', JSON.stringify({ sha256: identity.apkSha256, bytes: info.apkBytes, uid: Number(uidMatch[1]) }));
+    // Exercise the witness by a genuine read performed only by the synthetic helper.
+    store('provider-positive-control.txt', shell('am', 'start', '-W', '-n', `${HELPER}/.GrantActivity`, '--es', 'fixture', 'original', '--ez', 'audit', 'true'));
+    assert(witness() === 1, 'Real provider positive control must register exactly one open.');
+    store('initial-launch.txt', launch()); const nativeSignInEntry = await entry('01-native-sign-in-entry');
+    const firstPid = shell('pidof', APP); assert(/^[1-9]\d*$/.test(firstPid), 'Actual app PID missing.');
+    const debugging = (pid) => { assert(!new RegExp(`webview_devtools_remote_${pid}(?:\\s|$)`).test(shell('cat', '/proc/net/unix')), 'Release WebView debugging socket unexpectedly exposed.'); };
+    debugging(firstPid); assertUnread('initial');
+    store('wifi-disable.txt', shell('svc', 'wifi', 'disable')); store('data-disable.txt', shell('svc', 'data', 'disable'));
+    let connectivity = ''; const until = now() + 30000;
+    do { connectivity = shell('dumpsys', 'connectivity'); if (/Active default network:\s*none\b/.test(connectivity)) break; await pause(500); } while (now() < until);
+    store('offline-connectivity.txt', connectivity); assert(/Active default network:\s*none\b/.test(connectivity), 'Guest must actually be offline for denial proof.');
+    await entry('02-offline-entry');
+    store('warm-granted-launch.txt', grant('original')); await entry('03-warm-pdf-locked'); await pause(12000); health(); assertUnread('warm');
+    shell('am', 'force-stop', APP); assert(!shell('ps', '-A', '-o', 'PID,NAME').split(/\r?\n/).some((line) => line.trim().split(/\s+/).at(-1) === APP), 'App process survived force-stop.');
+    store('cold-granted-launch.txt', grant('original')); await entry('04-cold-pdf-locked');
+    const secondPid = shell('pidof', APP); assert(/^[1-9]\d*$/.test(secondPid) && secondPid !== firstPid, 'Cold URI did not create a fresh app process.'); debugging(secondPid); assertUnread('cold');
+    store('second-granted-launch.txt', grant('second')); await entry('05-second-pdf-locked'); await pause(12000); health(); assertUnread('second');
+    shell('input', 'keyevent', 'KEYCODE_HOME'); store('foreground-launch.txt', launch()); await entry('06-foreground-locked');
+    assert(shell('pidof', APP) === secondPid, 'Foreground proof must retain the cold URI process.'); assertUnread('foreground');
+    store('wifi-enable.txt', shell('svc', 'wifi', 'enable')); store('data-enable.txt', shell('svc', 'data', 'enable'));
+    await pause(12000); await entry('07-online-entry'); assertUnread('online'); debugging(secondPid);
+    for (const [name, value] of Object.entries(health())) store(`final-${name}.txt`, value); store('final-activities.txt', focused());
+    const result = { schemaVersion: 1, status: 'passed', scope: 'real-current-apk-paid-entry-and-anonymous-file-denial-only', ...os, repository: env.GITHUB_REPOSITORY, commit: env.GITHUB_SHA, runId: env.GITHUB_RUN_ID, attempt: env.GITHUB_RUN_ATTEMPT, appSourceCommit: identity.sourceCommit, buildRunId: String(info.runId), apkSha256: identity.apkSha256, metadataSha256: identity.metadataSha256, versionName: info.versionName, versionCode: info.versionCode, applicationId: APP, signingCertificateSha256: info.signingCertificateSha256, uid: Number(uidMatch[1]), initialPid: firstPid, relaunchedPid: secondPid, finalPid: secondPid, nativeSignInEntry, paidAccess: { required: true, accountState: 'anonymous', anonymousToolsAccessible: false, anonymousPdfReadAttempts: 0, providerOpenPositiveControl: 1, offlineDenied: true, warmIncomingDenied: true, coldIncomingDenied: true, authenticatedPaidAcceptance: false }, offlinePdf: false, authenticatedAccountAcceptance: false, capturedAt: new Date(now()).toISOString(), stages, files: [...files] };
+    store('result.json', JSON.stringify(result, null, 2)); output(`ANDROID_APP_SMOKE_PASSED api=${os.api} apk=${identity.apkSha256}\n`); return result;
+  } catch (error) {
+    const diagnosticErrors = [];
+    for (const [name, args] of [['failure-events.txt', ['shell', 'logcat', '-b', 'events', '-d']], ['failure-system.txt', ['shell', 'logcat', '-b', 'system', '-d']], ['failure-crash.txt', ['shell', 'logcat', '-b', 'crash', '-d']], ['failure-runtime.txt', ['shell', 'logcat', '-b', 'main', '-d', '-t', '200', '-s', 'ReactNativeJS:E', 'AndroidRuntime:E', 'Expo:E']], ['failure-activity.txt', ['shell', 'dumpsys', 'activity', 'activities']], ['failure-window.txt', ['shell', 'dumpsys', 'window', 'displays']], ['failure.png', ['exec-out', 'screencap', '-p']]]) {
       try { store(name, adb(args, 15000)); } catch (diagnostic) { diagnosticErrors.push({ name, message: String(diagnostic.message).slice(0, 2000) }); }
     }
     try { store('failure.xml', dump().xml); } catch (diagnostic) { diagnosticErrors.push({ name: 'failure.xml', message: String(diagnostic.message).slice(0, 2000) }); }

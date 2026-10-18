@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { APP, HELPER, REPOSITORY, PHRASE, SECOND_PHRASE, strictJson, inputIdentity, validateBuildInfo, validateAsset, fetchInput, fixturePdf, inspectSavedPdf, pngCrc, decodePng, pdfMarkers, uiNodes, selectNode, validateNativeSignIn, validateInstalledPackage, launcherComponent, validateLauncherStart, installedApkPath, signingCertificate, validateFixtureBadging, buildFixture, validateNativeEdges, assertRuntimeHealthy, runSmoke } from './android-app-smoke.mjs';
+import { APP, HELPER, REPOSITORY, PHRASE, SECOND_PHRASE, strictJson, inputIdentity, validateBuildInfo, validateAsset, fetchInput, fixturePdf, inspectSavedPdf, pngCrc, decodePng, pdfMarkers, uiNodes, selectNode, validateNativeSignIn, validateInstalledPackage, launcherComponent, validateLauncherStart, installedApkPath, signingCertificate, validateFixtureBadging, buildFixture, validateNativeEdges, assertRuntimeHealthy, runLegacyPdfSmoke as runSmoke, runSmoke as runPaidSmoke, validatePaidEntry, providerOpenCount } from './android-app-smoke.mjs';
 
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const apk = Buffer.alloc(1024 * 1024, 23); apk.set([80,75,3,4]);
@@ -381,4 +381,58 @@ test('orchestration simulation rejects instant provider errors and a stall beyon
 test('orchestration simulation rejects loss of subsequent valid provider access after the stall',async()=>{
   const simulation=simulatedDevice({rejectRecovery:true});
   try{await assert.rejects(runSmoke(simulation.options),/actual enabled UI control unavailable/i);const failure=JSON.parse(readFileSync(join(simulation.root,'failure.json'),'utf8'));assert.equal(failure.status,'failed');assert.ok(!failure.files.some((file)=>file.name==='native-edge-result.json'));}finally{rmSync(simulation.directory,{recursive:true,force:true});}
+});
+
+function simulatedPaidDevice({ providerReads = false, toolVisible = false, embeddedProvider = false, noPositiveControl = false, anr = false } = {}) {
+  const simulation = simulatedDevice({ embeddedProvider }); simulation.model.mode = 'auth';
+  let opens = 0; let pid = '4321'; let running = true;
+  const previous = simulation.options.execute;
+  simulation.options.execute = (file, args) => {
+    const command = args.slice(3); const joined = command.join(' ');
+    if (file === 'adb' && args[2] === 'shell') {
+      if (command[0] === 'run-as' && command.includes('files/provider-opens.log')) return Buffer.from(Array.from({ length: opens }, () => 'open:/original').join('\n'));
+      if (command[0] === 'am' && command[1] === 'start' && command.includes(`${HELPER}/.GrantActivity`)) {
+        if (command.includes('audit')) { if (!noPositiveControl) opens++; }
+        else { running = true; if (providerReads) opens++; if (toolVisible) simulation.model.mode = 'viewer'; }
+        return Buffer.from('Status: ok');
+      }
+      if (joined === `pidof ${APP}`) return Buffer.from(pid);
+      if (command[0] === 'am' && command[1] === 'force-stop') { running = false; pid = '5432'; return Buffer.from(''); }
+      if (command[0] === 'ps') return Buffer.from(running ? `PID NAME\n${pid} ${APP}` : 'PID NAME\n555 ai.anymize.smokefixture');
+      if (command[0] === 'logcat' && anr && simulation.model.offlineReads >= 2 && command.includes('events')) return Buffer.from('am_anr: com.android.systemui');
+    }
+    return previous(file, args);
+  };
+  return simulation;
+}
+
+test('paid-entry orchestration proves helper positive control and anonymous warm/cold/foreground denial without claiming paid acceptance', async () => {
+  const simulation = simulatedPaidDevice();
+  try {
+    const result = await runPaidSmoke(simulation.options);
+    assert.equal(result.scope, 'real-current-apk-paid-entry-and-anonymous-file-denial-only');
+    assert.equal(result.offlinePdf, false); assert.equal(result.authenticatedAccountAcceptance, false);
+    assert.deepEqual(result.paidAccess, { required: true, accountState: 'anonymous', anonymousToolsAccessible: false, anonymousPdfReadAttempts: 0, providerOpenPositiveControl: 1, offlineDenied: true, warmIncomingDenied: true, coldIncomingDenied: true, authenticatedPaidAcceptance: false });
+    assert.equal(result.stages.length, 7); assert.notEqual(result.initialPid, result.relaunchedPid);
+    assert.ok(result.files.some((file) => file.name === 'online-provider.json'));
+    assert.ok(!result.files.some((file) => file.name.endsWith('.pdf')));
+    for (const file of result.files) assert.equal(hash(readFileSync(join(simulation.root, file.name))), file.sha256);
+    assert.ok(!simulation.model.calls.some(([, args]) => args.includes('logcat') && args.includes('-c')));
+  } finally { rmSync(simulation.directory, { recursive: true, force: true }); }
+});
+
+test('paid entry rejects real anonymous reads, visible tools, embedded provider, absent positive witness and ANR signals', async () => {
+  for (const [options, pattern] of [[{providerReads:true},/Anonymous app read/], [{toolVisible:true},/Anonymous PDF tool/], [{embeddedProvider:true},/Embedded provider/], [{noPositiveControl:true},/positive provider witness/], [{anr:true},/ANR observed/]]) {
+    const simulation = simulatedPaidDevice(options);
+    try { await assert.rejects(runPaidSmoke(simulation.options), pattern); assert.equal(JSON.parse(readFileSync(join(simulation.root, 'failure.json'))).status, 'failed'); assert.ok(!existsSync(join(simulation.root, 'result.json'))); }
+    finally { rmSync(simulation.directory, { recursive: true, force: true }); }
+  }
+});
+
+test('provider witness cannot report success from an empty, malformed or excessive log', () => {
+  assert.equal(providerOpenCount('open:/original\n'), 1); assert.equal(providerOpenCount('open:/original\nopen:/second\n'), 2);
+  for (const value of ['', '0', 'open:/foreign', 'open:/original\nmalformed', 'x'.repeat(4097)]) assert.throws(() => providerOpenCount(value));
+  const button = { package: APP, text: 'Sign in with anymize', class: 'android.widget.Button', enabled: 'true', clickable: 'true', 'resource-id': 'native-sign-in-action', rect: [10,100,400,160] };
+  assert.ok(validatePaidEntry([button]));
+  for (const node of [{class:'android.webkit.WebView'}, {class:'android.widget.EditText'}, {text:'Open PDF',enabled:'true',clickable:'true'}, {text:'anymize-smoke-second.pdf'}]) assert.throws(() => validatePaidEntry([button,{package:APP,...node}]));
 });

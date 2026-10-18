@@ -13,6 +13,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.FileNotFoundException;
+import java.nio.charset.StandardCharsets;
 
 /** Read-only, non-exported provider. No network, foreign paths or production data. */
 public final class FixtureProvider extends ContentProvider {
@@ -56,6 +57,14 @@ public final class FixtureProvider extends ContentProvider {
   @Override public ParcelFileDescriptor openFile(Uri uri, String mode, CancellationSignal signal) throws FileNotFoundException {
     if (!"r".equals(mode)) throw new FileNotFoundException("Synthetic provider is read-only");
     File selected = file(uri);
+    // This helper-private append-only witness observes attempted reads by the
+    // unchanged production APK. The harness proves it first with a helper read.
+    synchronized (FixtureProvider.class) {
+      try (FileOutputStream audit = new FileOutputStream(new File(getContext().getFilesDir(), "provider-opens.log"), true)) {
+        audit.write(("open:" + uri.getPath() + "\n").getBytes(StandardCharsets.US_ASCII));
+        audit.flush();
+      } catch (Exception error) { throw new IllegalStateException("Synthetic read witness failed", error); }
+    }
     if ("/stall".equals(uri.getPath())) {
       // A genuine binder-side provider stall. A responsive app must cancel its
       // own bounded read, keep the prior PDF live and still accept a later URI.

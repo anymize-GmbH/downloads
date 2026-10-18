@@ -13,6 +13,15 @@ public final class GrantActivity extends Activity {
     String selected = getIntent().getStringExtra("fixture");
     if (!"saved".equals(selected) && !"second".equals(selected) && !"stall".equals(selected)) selected = "original";
     Uri uri = Uri.parse("content://ai.anymize.smokefixture.pdf/" + selected);
+    if (getIntent().getBooleanExtra("audit", false)) {
+      // Genuine positive control: only the helper opens its own fixture. This
+      // path neither launches the suite nor changes its authentication state.
+      try (android.os.ParcelFileDescriptor file = getContentResolver().openFileDescriptor(uri, "r")) {
+        if (file == null) throw new IllegalStateException("Synthetic read returned no descriptor");
+      } catch (Exception error) { throw new IllegalStateException("Synthetic positive control failed", error); }
+      finish();
+      return;
+    }
     Intent view = new Intent(Intent.ACTION_VIEW);
     view.setDataAndType(uri, "application/pdf");
     view.setPackage("ai.anymize.mobile");
