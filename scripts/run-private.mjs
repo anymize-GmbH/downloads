@@ -27,12 +27,17 @@ if (!Object.hasOwn(commands, phase) || platform && !['win', 'mac', 'linux'].incl
 const logPath = join(root, `.git/private-${phase}.log`);
 const descriptor = openSync(logPath, 'w', 0o600);
 let failed = false;
+const typeChecks = { app: 'not-run', server: 'not-run' };
 try {
-  for (const [program, args] of commands[phase]) {
+  for (const [index, [program, args]] of commands[phase].entries()) {
     const result = spawnSync(program, args, { cwd: root, windowsHide: true, shell: process.platform === 'win32' && [npm, npx].includes(program), stdio: ['ignore', descriptor, descriptor], timeout: 2700000 });
-    if (result.error || result.status !== 0) { failed = true; break; }
+    const passed = !result.error && result.status === 0;
+    const independentTypecheck = phase === 'web-types' && index >= 2;
+    if (independentTypecheck) typeChecks[index === 2 ? 'app' : 'server'] = passed ? 'passed' : 'failed';
+    if (!passed) { failed = true; if (!independentTypecheck) break; }
   }
 } finally { closeSync(descriptor); }
+if (phase === 'web-types') process.stdout.write(`Web type checks: app=${typeChecks.app}, server=${typeChecks.server}.\n`);
 if (failed) {
   const key = randomBytes(32), iv = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', key, iv);
