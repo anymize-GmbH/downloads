@@ -141,17 +141,18 @@ test('exact source/cipher, pinned actions and no-PAT boundaries remain on all re
 test('compile-only evidence precedes runtime and cannot claim a successful launch', () => {
   const steps = workflow.jobs['ios-simulator'].steps;
   const compileIndex = steps.findIndex((step) => step.id === 'compile_ios'), compiledIndex = steps.findIndex((step) => step.with?.name?.startsWith('preview-ios-simulator-compile-only-'));
-  const runtimeIndex = steps.findIndex((step) => step.id === 'runtime_ios'), verifiedIndex = steps.findIndex((step) => step.with?.name === 'preview-ios-simulator-${{ github.run_id }}-${{ github.run_attempt }}');
-  assert.ok(compileIndex >= 0); assert.equal(compiledIndex, compileIndex + 1); assert.equal(runtimeIndex, compiledIndex + 1); assert.ok(verifiedIndex > runtimeIndex);
+  const runtimeIndex = steps.findIndex((step) => step.id === 'runtime_ios'), bindIndex = steps.findIndex((step) => step.id === 'bind_ios'), verifiedIndex = steps.findIndex((step) => step.with?.name === 'preview-ios-simulator-${{ github.run_id }}-${{ github.run_attempt }}');
+  assert.ok(compileIndex >= 0); assert.equal(compiledIndex, compileIndex + 1); assert.equal(runtimeIndex, compiledIndex + 1); assert.equal(bindIndex, runtimeIndex + 1); assert.ok(verifiedIndex > bindIndex);
   assert.equal(steps[compileIndex].run, 'node scripts/run-private.mjs ios'); assert.equal(steps[runtimeIndex].run, 'node scripts/run-private.mjs ios-smoke');
   const compiled = steps[compiledIndex], verified = steps[verifiedIndex];
   assert.equal(compiled.uses, uploadAction); assert.deepEqual(paths(compiled), compileFiles); assert.equal(compiled.with['if-no-files-found'], 'error'); assert.equal(compiled.with['retention-days'], 14);
   assert.equal(verified.uses, uploadAction); assert.deepEqual(paths(verified), ['private-input/source/artifacts/ios-simulator/*.tar.gz', ...compileFiles.slice(1), 'private-input/source/artifacts/ios-simulator-smoke/result.json', 'private-input/source/artifacts/ios-simulator-smoke/*.png']);
-  for (const step of [steps[compileIndex], steps[runtimeIndex], compiled, verified]) assert.equal(step['continue-on-error'], undefined);
+  for (const step of [steps[compileIndex], steps[runtimeIndex], steps[bindIndex], compiled, verified]) assert.equal(step['continue-on-error'], undefined);
   assert.equal(condition(compiled.if, { success: true, steps: { compile_ios: 'success' } }), true);
   for (const success of [true, false]) assert.equal(condition(compiled.if, { success, steps: { compile_ios: 'failure' } }), false);
-  assert.equal(condition(verified.if, { success: true, steps: { compile_ios: 'success', runtime_ios: 'success' } }), true);
-  for (const success of [true, false]) assert.equal(condition(verified.if, { success, steps: { compile_ios: 'success', runtime_ios: 'failure' } }), false);
+  const complete = { preboot_ios: 'success', compile_ios: 'success', runtime_ios: 'success', bind_ios: 'success' };
+  assert.equal(condition(verified.if, { success: true, steps: complete }), true);
+  for (const stage of Object.keys(complete)) for (const status of ['failure', 'skipped', undefined]) for (const success of [true, false]) assert.equal(condition(verified.if, { success, steps: { ...complete, [stage]: status } }), false);
   const failure = steps.filter((step) => step.if === 'failure()'); assert.equal(failure.length, 2);
   const encrypted = failure.find((step) => step.with.name === 'encrypted-diagnostics-ios-${{ github.run_id }}');
   assert.ok(encrypted); assert.equal(encrypted.uses, uploadAction); assert.equal(encrypted.with.path, 'artifacts/encrypted-diagnostics/*.json');
@@ -160,4 +161,43 @@ test('compile-only evidence precedes runtime and cannot claim a successful launc
   assert.deepEqual(paths(os), ['private-input/source/artifacts/ios-simulator-smoke/os-before-launch.png']);
   assert.equal(os.with['if-no-files-found'], 'warn'); assert.equal(os.with['retention-days'], 7);
   assert.equal(os['continue-on-error'], undefined); assert.doesNotMatch(os.with.name, /runtime|compile-only/);
+});
+
+function assertEarlyPreboot(definition) {
+  const steps = definition.jobs['ios-simulator'].steps;
+  const fetchIndex = steps.findIndex(step => step.run === 'node scripts/fetch-build-input.mjs');
+  const prebootIndex = steps.findIndex(step => step.id === 'preboot_ios');
+  const installIndex = steps.findIndex(step => step.run === 'node scripts/run-private.mjs install');
+  const checkIndex = steps.findIndex(step => step.run === 'node scripts/run-private.mjs check');
+  const compileIndex = steps.findIndex(step => step.id === 'compile_ios');
+  const runtimeIndex = steps.findIndex(step => step.id === 'runtime_ios');
+  const bindIndex = steps.findIndex(step => step.id === 'bind_ios');
+  assert.ok(fetchIndex >= 0); assert.equal(prebootIndex, fetchIndex + 1); assert.ok(prebootIndex < installIndex && installIndex < checkIndex && checkIndex < compileIndex);
+  assert.equal(steps[prebootIndex].run, 'node scripts/ios-preboot.mjs start'); assert.equal(steps[bindIndex].run, 'node scripts/ios-preboot.mjs verify'); assert.equal(bindIndex, runtimeIndex + 1);
+  for (const step of [steps[prebootIndex], steps[bindIndex]]) { assert.equal(step.if, undefined); assert.equal(step.env, undefined); assert.equal(step['continue-on-error'], undefined); }
+  assert.equal(steps.filter(step => /ios-preboot\.mjs/.test(step.run || '')).length, 2);
+  const receipts = steps.find(step => step.with?.name === 'preview-ios-preboot-binding-${{ github.run_id }}-${{ github.run_attempt }}');
+  assert.ok(receipts && steps.indexOf(receipts) > bindIndex); assert.equal(receipts.uses, uploadAction);
+  assert.deepEqual(paths(receipts), ['artifacts/ios-preboot/preboot.json', 'artifacts/ios-preboot/runtime-binding.json']);
+  assert.equal(receipts.with['if-no-files-found'], 'error'); assert.equal(receipts.with['retention-days'], 14); assert.equal(receipts['continue-on-error'], undefined);
+  assert.equal(condition(receipts.if, { success: true, steps: { bind_ios: 'success' } }), true);
+  for (const success of [true, false]) for (const status of ['failure', 'skipped', undefined]) assert.equal(condition(receipts.if, { success, steps: { bind_ios: status } }), false);
+}
+
+test('real YAML preboots only after authenticated source and before long compilation, then binds before runtime publication', () => {
+  assertEarlyPreboot(workflow);
+  assert.equal(workflow.jobs['ios-simulator']['runs-on'], 'macos-26');
+  assert.deepEqual(workflow.jobs['ios-simulator'].env, { DEVELOPER_DIR: '/Applications/Xcode_26.6.app/Contents/Developer', COCOAPODS_DISABLE_STATS: 'true', RCT_NO_LAUNCH_PACKAGER: '1' });
+  // Moving boot early never changes the private 6f smoke, its 180s/60s caps,
+  // archive integrity, mandatory bootstatus exit 0, launch, PID or PNG oracle.
+  assert.equal(workflow.jobs['ios-simulator'].steps.find(step => step.id === 'runtime_ios').run, 'node scripts/run-private.mjs ios-smoke');
+});
+
+test('workflow controls detect late boot, ignored startup, skipped binding and broad receipt uploads', () => {
+  for (const mutate of [
+    value => { const steps = value.jobs['ios-simulator'].steps; const index = steps.findIndex(step => step.id === 'preboot_ios'); const [step] = steps.splice(index, 1); steps.splice(steps.findIndex(item => item.id === 'compile_ios'), 0, step); },
+    value => value.jobs['ios-simulator'].steps.find(step => step.id === 'preboot_ios')['continue-on-error'] = true,
+    value => value.jobs['ios-simulator'].steps.find(step => step.id === 'bind_ios').if = 'success()',
+    value => value.jobs['ios-simulator'].steps.find(step => step.with?.name?.startsWith('preview-ios-preboot-binding-')).with.path = 'artifacts/**',
+  ]) { const changed = structuredClone(workflow); mutate(changed); assert.throws(() => assertEarlyPreboot(changed)); }
 });

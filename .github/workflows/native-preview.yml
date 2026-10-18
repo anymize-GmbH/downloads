@@ -158,6 +158,9 @@ jobs:
           BUILD_INPUT_SHA256: ${{ inputs.input_sha256 }}
           BUILD_INPUT_METADATA_SHA256: ${{ inputs.metadata_sha256 }}
           BUILD_INPUT_DECRYPTION_KEY: ${{ secrets.BUILD_INPUT_DECRYPTION_KEY }}
+      - name: Begin exact selected simulator boot while compiling
+        id: preboot_ios
+        run: node scripts/ios-preboot.mjs start
       - run: node scripts/run-private.mjs install
       - run: node scripts/run-private.mjs check
       - name: Compile and integrity-seal simulator application
@@ -177,9 +180,12 @@ jobs:
       - name: Install, launch and relaunch on real ephemeral iOS simulator
         id: runtime_ios
         run: node scripts/run-private.mjs ios-smoke
+      - name: Bind real runtime evidence to the early selected simulator
+        id: bind_ios
+        run: node scripts/ios-preboot.mjs verify
       - name: Preserve runtime-verified iOS simulator and launch evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: success() && steps.compile_ios.outcome == 'success' && steps.runtime_ios.outcome == 'success'
+        if: success() && steps.preboot_ios.outcome == 'success' && steps.compile_ios.outcome == 'success' && steps.runtime_ios.outcome == 'success' && steps.bind_ios.outcome == 'success'
         with:
           name: preview-ios-simulator-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -188,6 +194,16 @@ jobs:
             private-input/source/artifacts/ios-simulator/SHA256SUMS
             private-input/source/artifacts/ios-simulator-smoke/result.json
             private-input/source/artifacts/ios-simulator-smoke/*.png
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve bounded simulator selection and runtime binding receipts
+        if: success() && steps.bind_ios.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: preview-ios-preboot-binding-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/ios-preboot/preboot.json
+            artifacts/ios-preboot/runtime-binding.json
           if-no-files-found: error
           retention-days: 14
       - name: Preserve selected-simulator OS context without claiming app success
