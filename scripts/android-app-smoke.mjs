@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inflateSync } from 'node:zlib';
 import { assertNoAnr, validateExpectedIdentity } from './emulator-baseline.mjs';
+import { ENCRYPTED_ANDROID_INPUT_NAME, MIN_ANDROID_ENVELOPE_BYTES, MAX_ANDROID_ENVELOPE_BYTES, openAndroidInput } from './encrypt-android-input.mjs';
 
 export const REPOSITORY = 'anymize-GmbH/downloads';
 export const APP = 'ai.anymize.mobile';
@@ -74,8 +75,31 @@ export function validateAsset(value, { id, name, size, digest }) {
 export function fetchInput({ env = process.env, root = INPUT, execute = execFileSync } = {}) {
   const identity = inputIdentity(env);
   assert(typeof env.GH_TOKEN === 'string' && env.GH_TOKEN.length > 0, 'Read-only own-repository GitHub token required.');
+  const encryptedId = env.ENCRYPTED_INPUT_ASSET_ID ?? '', encryptedSha = env.ENCRYPTED_INPUT_SHA256 ?? '';
+  const encrypted = encryptedId !== '' || encryptedSha !== '';
+  assert(!encrypted || positiveId(encryptedId) && hex(encryptedSha, 64) && ![identity.apkAssetId, identity.metadataAssetId].includes(encryptedId), 'Exact distinct encrypted input asset and digest required.');
+  const keyText = env.ANDROID_APP_INPUT_KEY;
+  const childEnvironment = { ...process.env, ...env }; delete childEnvironment.ANDROID_APP_INPUT_KEY;
   mkdirSync(root, { recursive: true });
-  const api = (id, binary, max) => execute('gh', ['api', ...(binary ? ['-H', 'Accept: application/octet-stream'] : []), `repos/${REPOSITORY}/releases/assets/${id}`], { timeout: 180000, maxBuffer: max, stdio: ['ignore', 'pipe', 'pipe'] });
+  const api = (id, binary, max) => execute('gh', ['api', ...(binary ? ['-H', 'Accept: application/octet-stream'] : []), `repos/${REPOSITORY}/releases/assets/${id}`], { timeout: 180000, maxBuffer: max, env: childEnvironment, stdio: ['ignore', 'pipe', 'pipe'] });
+  if (encrypted) {
+    assert(typeof keyText === 'string' && /^[A-Za-z0-9_-]{43}$/.test(keyText), 'Exact one-run Android input key required.');
+    const selected = strictJson(api(encryptedId, false, MAX_JSON_BYTES).toString('utf8'));
+    assert(Number.isSafeInteger(selected?.size) && selected.size >= MIN_ANDROID_ENVELOPE_BYTES && selected.size <= MAX_ANDROID_ENVELOPE_BYTES, 'Encrypted APK bundle size rejected.');
+    validateAsset(selected, { id: encryptedId, name: ENCRYPTED_ANDROID_INPUT_NAME, size: selected.size, digest: encryptedSha });
+    const bytes = api(encryptedId, true, MAX_ANDROID_ENVELOPE_BYTES);
+    assert(bytes.length === selected.size, 'Encrypted APK bundle bytes differ.');
+    const opened = openAndroidInput(bytes, identity, encryptedSha, keyText);
+    try {
+      const info = validateBuildInfo(opened.metadataBytes, identity);
+      assert(opened.apk.length === info.apkBytes, 'Downloaded APK bytes differ.');
+      writeFileSync(join(root, ASSET_NAME), opened.apk, { flag: 'wx', mode: 0o600 });
+      writeFileSync(join(root, 'build-info.json'), opened.metadataBytes, { flag: 'wx', mode: 0o600 });
+      writeFileSync(join(root, 'selection.json'), JSON.stringify(identity, null, 2), { flag: 'wx', mode: 0o600 });
+      process.stdout.write(`ANDROID_APP_INPUT_VERIFIED source=${identity.sourceCommit} sha256=${identity.apkSha256} transport=aes-256-gcm\n`);
+      return { identity, info };
+    } finally { opened.apk.fill(0); opened.metadataBytes.fill(0); }
+  }
   const metadataBytes = api(identity.metadataAssetId, true, MAX_JSON_BYTES);
   const info = validateBuildInfo(metadataBytes, identity);
   const metadataAsset = strictJson(api(identity.metadataAssetId, false, MAX_JSON_BYTES).toString('utf8'));
@@ -638,5 +662,5 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     else if (['--compile-helper', '--build-fixture'].includes(process.argv[2])) buildFixture();
     else if (process.argv[2] === '--run') await runSmoke();
     else throw new Error('Unsupported smoke command.');
-  } catch (error) { process.stderr.write(`Android app smoke failed: ${String(error.message).slice(0, 4000)}\n`); process.exitCode = 1; }
+  } catch (error) { process.stderr.write(process.argv[2] === '--fetch' ? 'Android APK input rejected.\n' : `Android app smoke failed: ${String(error.message).slice(0, 4000)}\n`); process.exitCode = 1; }
 }

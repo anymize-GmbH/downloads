@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
 import { APP, HELPER, REPOSITORY, PHRASE, SECOND_PHRASE, strictJson, inputIdentity, validateBuildInfo, validateAsset, fetchInput, fixturePdf, inspectSavedPdf, pngCrc, decodePng, pdfMarkers, uiNodes, selectNode, validateNativeSignIn, validateInstalledPackage, launcherComponent, validateLauncherStart, installedApkPath, signingCertificate, validateFixtureBadging, buildFixture, validateNativeEdges, assertRuntimeHealthy, runLegacyPdfSmoke as runSmoke, runSmoke as runPaidSmoke, validatePaidEntry, providerOpenCount } from './android-app-smoke.mjs';
+import { ENCRYPTED_ANDROID_INPUT_NAME, MAX_ANDROID_ENVELOPE_BYTES, sealAndroidInput } from './encrypt-android-input.mjs';
 
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const apk = Buffer.alloc(1024 * 1024, 23); apk.set([80,75,3,4]);
@@ -66,6 +67,58 @@ test('tampered metadata fails before requesting any APK bytes', () => {
   const root=mkdtempSync(join(tmpdir(),'anymize-smoke-tamper-')); let calls=0;
   try { assert.throws(() => fetchInput({env,root,execute:()=>{calls++;return Buffer.from('{"signingCertificateSha256":"attacker"}');}}),/hash differs/); assert.equal(calls,1); }
   finally {rmSync(root,{recursive:true,force:true});}
+});
+
+test('encrypted transport fetches only its immutable own-repository envelope and preserves every original identity check', () => {
+  const root=mkdtempSync(join(tmpdir(),'anymize-smoke-encrypted-')); const calls=[]; const key=Buffer.alloc(32,19);
+  const encrypted=sealAndroidInput(apk,raw,inputIdentity(env),key);
+  const selected={...env,ENCRYPTED_INPUT_ASSET_ID:'125',ENCRYPTED_INPUT_SHA256:hash(encrypted),ANDROID_APP_INPUT_KEY:key.toString('base64url')};
+  try {
+    const execute=(file,args,options)=>{
+      calls.push(args);assert.equal(file,'gh');assert.equal(args.at(-1),`repos/${REPOSITORY}/releases/assets/125`);
+      assert.equal(options.env.ANDROID_APP_INPUT_KEY,undefined,'The decrypt key never reaches gh');assert.equal(options.env.GH_TOKEN,env.GH_TOKEN);
+      return args.includes('Accept: application/octet-stream')?encrypted:Buffer.from(JSON.stringify(asset('125',ENCRYPTED_ANDROID_INPUT_NAME,encrypted)));
+    };
+    assert.equal(fetchInput({env:selected,root,execute}).info.sourceCommit,info.sourceCommit);
+    assert.equal(calls.length,2);assert.deepEqual(readFileSync(join(root,info.apk)),apk);assert.deepEqual(readFileSync(join(root,'build-info.json')),raw);
+    assert.deepEqual(JSON.parse(readFileSync(join(root,'selection.json'),'utf8')),inputIdentity(env));
+    assert.equal(readFileSync(join(root,'selection.json'),'utf8').includes(selected.ANDROID_APP_INPUT_KEY),false);
+  } finally {rmSync(root,{recursive:true,force:true});}
+});
+
+test('encrypted tamper, bad key, wrong AAD and invalid raw build contract fail without plaintext output or fallback', () => {
+  const key=Buffer.alloc(32,20),identity=inputIdentity(env),encrypted=sealAndroidInput(apk,raw,identity,key);
+  for(const patch of [{ANDROID_APP_INPUT_KEY:Buffer.alloc(32,21).toString('base64url')},{APP_SOURCE_COMMIT:'c'.repeat(40)},
+    {APK_SHA256:'d'.repeat(64)},{BUILD_INFO_SHA256:'e'.repeat(64)},{APK_ASSET_ID:'126'},{BUILD_INFO_ASSET_ID:'127'}]) {
+    const root=mkdtempSync(join(tmpdir(),'anymize-smoke-key-denial-'));let calls=0;
+    try {
+      assert.throws(()=>fetchInput({root,env:{...env,ENCRYPTED_INPUT_ASSET_ID:'125',ENCRYPTED_INPUT_SHA256:hash(encrypted),ANDROID_APP_INPUT_KEY:key.toString('base64url'),...patch},
+        execute:(_file,args)=>{calls++;assert.equal(args.at(-1),`repos/${REPOSITORY}/releases/assets/125`);return args.includes('Accept: application/octet-stream')?encrypted:Buffer.from(JSON.stringify(asset('125',ENCRYPTED_ANDROID_INPUT_NAME,encrypted)));}}));
+      assert.equal(calls,2);assert.deepEqual(readdirSync(root),[]);
+    } finally {rmSync(root,{recursive:true,force:true});}
+  }
+  const badRaw=Buffer.from(JSON.stringify({...info,variant:'debug'}));const badIdentity={...identity,metadataSha256:hash(badRaw)};
+  const badEnvelope=sealAndroidInput(apk,badRaw,badIdentity,key),root=mkdtempSync(join(tmpdir(),'anymize-smoke-bad-contract-'));
+  try {
+    assert.throws(()=>fetchInput({root,env:{...env,BUILD_INFO_SHA256:hash(badRaw),ENCRYPTED_INPUT_ASSET_ID:'125',ENCRYPTED_INPUT_SHA256:hash(badEnvelope),ANDROID_APP_INPUT_KEY:key.toString('base64url')},
+      execute:(_file,args)=>args.includes('Accept: application/octet-stream')?badEnvelope:Buffer.from(JSON.stringify(asset('125',ENCRYPTED_ANDROID_INPUT_NAME,badEnvelope)))}),/selected standalone release/);
+    assert.deepEqual(readdirSync(root),[]);
+  } finally {rmSync(root,{recursive:true,force:true});}
+});
+
+test('encrypted asset ID/hash pairing, exact name, bounds and API identity cannot be substituted', () => {
+  const key=Buffer.alloc(32,22),encrypted=sealAndroidInput(apk,raw,inputIdentity(env),key);
+  const valid={...env,ENCRYPTED_INPUT_ASSET_ID:'125',ENCRYPTED_INPUT_SHA256:hash(encrypted),ANDROID_APP_INPUT_KEY:key.toString('base64url')};
+  for(const patch of [{ENCRYPTED_INPUT_ASSET_ID:''},{ENCRYPTED_INPUT_SHA256:''},{ENCRYPTED_INPUT_ASSET_ID:'123'},{ENCRYPTED_INPUT_ASSET_ID:'https://evil.test/x'},{ANDROID_APP_INPUT_KEY:''}]) {
+    const root=mkdtempSync(join(tmpdir(),'anymize-smoke-selection-denial-'));
+    try {assert.throws(()=>fetchInput({root,env:{...valid,...patch},execute:()=>assert.fail('Rejected before any asset request')}));}
+    finally {rmSync(root,{recursive:true,force:true});}
+  }
+  for(const patch of [{name:'other.bin'},{url:'https://evil.test/x'},{digest:'sha256:'+'f'.repeat(64)},{state:'new'},{size:MAX_ANDROID_ENVELOPE_BYTES+1},{size:100}]) {
+    const root=mkdtempSync(join(tmpdir(),'anymize-smoke-asset-denial-'));let calls=0;
+    try {assert.throws(()=>fetchInput({root,env:valid,execute:()=>{calls++;return Buffer.from(JSON.stringify({...asset('125',ENCRYPTED_ANDROID_INPUT_NAME,encrypted),...patch}));}}));assert.equal(calls,1);assert.deepEqual(readdirSync(root),[]);}
+    finally {rmSync(root,{recursive:true,force:true});}
+  }
 });
 
 test('synthetic PDF has correct xref byte offsets, one page and known text', () => {
@@ -191,6 +244,16 @@ test('workflow preserves exact verified OS setup, immutable inputs and safe evid
   for(const api of ['35','36','37'])assert.match(workflow,new RegExp(`api: '${api}'`));assert.match(workflow,/sdk: '37\.0'/);assert.match(workflow,/google_apis_ps16k/);assert.match(workflow,/pages: '16384'/);
   for(const bad of ['-no-boot-anim','--no-sandbox','enable-webview','NODE_AUTH_TOKEN','contents: write','artifacts/android-app-input/','fixture-build/'])assert.ok(!workflow.includes(bad));
   assert.equal([...workflow.matchAll(/GH_TOKEN:/g)].length,1);assert.match(workflow,/saved-copy\.pdf/);
+});
+
+test('decrypt secret exists only on the fetch step and encrypted transport never adds plaintext uploads or publication rights', () => {
+  const workflow=readFileSync(new URL('../.github/workflows/android-app-smoke.yml',import.meta.url),'utf8');
+  assert.equal([...workflow.matchAll(/ANDROID_APP_INPUT_KEY:/g)].length,1);
+  const fetch=workflow.split('      - name: Fetch exact current APK and independently hashed build metadata')[1].split('      - uses:')[0];
+  assert.match(fetch,/ANDROID_APP_INPUT_KEY: \$\{\{ secrets\.ANDROID_APP_INPUT_KEY \}\}/);assert.match(fetch,/node scripts\/android-app-smoke\.mjs --fetch/);
+  assert.match(workflow,/encrypted_input_asset_id:[\s\S]*?required: false/);assert.match(workflow,/encrypted_input_sha256:[\s\S]*?required: false/);
+  const uploads=workflow.split('      - name: Preserve only synthetic APK operation evidence')[1];
+  for(const forbidden of ['android-app-input/','*.apk','*.bin','*.key','contents: write'])assert.ok(!uploads.includes(forbidden));
 });
 
 test('push source compilation is independent, token-free and cannot start emulator jobs', () => {
