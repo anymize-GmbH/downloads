@@ -36,6 +36,13 @@ try {
     if (independentTypecheck) typeChecks[index === 2 ? 'app' : 'server'] = passed ? 'passed' : 'failed';
     if (!passed) { failed = true; if (!independentTypecheck) break; }
   }
+  if (failed) {
+    writeFileSync(descriptor, '\nPrivate source Git status after phase failure:\n');
+    const status = spawnSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+      cwd: root, windowsHide: true, stdio: ['ignore', descriptor, descriptor], timeout: 30000,
+    });
+    writeFileSync(descriptor, `\nPrivate source Git status result: exit=${status.status}, signal=${status.signal ?? 'none'}, spawnError=${Boolean(status.error)}.\n`);
+  }
 } finally { closeSync(descriptor); }
 if (phase === 'web-types') process.stdout.write(`Web type checks: app=${typeChecks.app}, server=${typeChecks.server}.\n`);
 if (failed) {
