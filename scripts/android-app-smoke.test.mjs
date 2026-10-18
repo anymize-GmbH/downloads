@@ -16,7 +16,7 @@ const asset = (id, name, bytes) => ({ id: Number(id), name, size: bytes.length, 
 
 test('strict JSON rejects duplicate nested keys and malformed or oversized input', () => {
   assert.deepEqual(strictJson('{"a":[{"b":"quoted \\\" text"}],"c":true}'), { a: [{b:'quoted " text'}], c:true });
-  for (const text of ['{"a":1,"a":2}', '{"nested":{"x":1,"x":2}}', '{"a":1,"\\u0061":2}', '[] trailing', ' '.repeat(262145)]) assert.throws(() => strictJson(text));
+  for (const text of ['{"a":1,"a":2}', '{"nested":{"x":1,"x":2}}', '{"a":1,"\\u0061":2}', '[] trailing', JSON.stringify({large:'x'.repeat(1024*1024)})]) assert.throws(() => strictJson(text));
 });
 
 test('input identity is limited to exact own repository, hashes and distinct numeric assets', () => {
@@ -30,6 +30,14 @@ test('raw metadata hash is checked before parsing and binds all APK release iden
   for (const patch of [{applicationId:'other.app'}, {variant:'debug'}, {embeddedJavaScript:false}, {sourceCommit:'c'.repeat(40)}, {apk:'../other.apk'}, {apkSha256:'c'.repeat(64)}, {apkBytes:512*1024**2+1}, {versionCode:0}, {versionName:'<script>'}, {targetSdk:35}, {minSdk:36}, {supportedAbis:['arm64-v8a']}, {signingCertificateSha256:'x'.repeat(64)}, {runId:null}, {distribution:'reverified-sideload-preview-only'}]) {
     const bytes=Buffer.from(JSON.stringify({...info,...patch})); assert.throws(() => validateBuildInfo(bytes,{...inputIdentity(env),metadataSha256:hash(bytes)}));
   }
+});
+
+test('hash-bound expanded native alignment metadata fits the collector 1 MiB bound but cannot exceed it', () => {
+  const bytes=Buffer.from(JSON.stringify({...info,pageAlignment:{syntheticExpandedProof:'x'.repeat(400*1024)}}));
+  assert.ok(bytes.length>262144 && bytes.length<1024*1024);
+  assert.equal(validateBuildInfo(bytes,{...inputIdentity(env),metadataSha256:hash(bytes)}).applicationId,APP);
+  const tooLarge=Buffer.from(JSON.stringify({...info,pageAlignment:{syntheticExpandedProof:'x'.repeat(1024*1024)}}));
+  assert.throws(()=>validateBuildInfo(tooLarge,{...inputIdentity(env),metadataSha256:hash(tooLarge)}),/exceeds 1 MiB/);
 });
 
 test('asset metadata rejects arbitrary URLs, altered state, names, bytes and checksums', () => {

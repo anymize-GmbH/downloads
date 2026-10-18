@@ -11,6 +11,7 @@ export const APP = 'ai.anymize.mobile';
 export const HELPER = 'ai.anymize.smokefixture';
 export const PHRASE = 'ANYMIZE_SMOKE_731';
 const ASSET_NAME = 'anymize-preview-debug-signed.apk';
+const MAX_JSON_BYTES = 1024 * 1024;
 const INPUT = 'artifacts/android-app-input';
 const OUTPUT = 'artifacts/android-app-smoke';
 const FIXTURES = fileURLToPath(new URL('./android-app-smoke-fixtures/', import.meta.url));
@@ -26,7 +27,7 @@ const regular = (path, max) => {
 };
 
 export function strictJson(text) {
-  assert(typeof text === 'string' && Buffer.byteLength(text) <= 262144, 'Bounded JSON required.');
+  assert(typeof text === 'string' && Buffer.byteLength(text) <= MAX_JSON_BYTES, 'Bounded JSON required.');
   const value = JSON.parse(text); const stack = [];
   for (let index = 0; index < text.length; index++) {
     if (text[index] === '"') {
@@ -49,7 +50,7 @@ export function inputIdentity(env) {
 }
 
 export function validateBuildInfo(bytes, identity) {
-  assert(Buffer.isBuffer(bytes) && bytes.length <= 262144 && sha(bytes) === identity.metadataSha256, 'Raw build metadata hash differs.');
+  assert(Buffer.isBuffer(bytes) && bytes.length <= MAX_JSON_BYTES && sha(bytes) === identity.metadataSha256, 'Raw build metadata hash differs or exceeds 1 MiB.');
   const value = strictJson(bytes.toString('utf8'));
   assert(value?.schemaVersion === 1 && value.distribution === 'sideload-preview-only' && value.signing === 'public-expo-template-debug-certificate'
     && value.variant === 'release' && value.embeddedJavaScript === true && value.applicationId === APP && value.sourceCommit === identity.sourceCommit
@@ -74,11 +75,11 @@ export function fetchInput({ env = process.env, root = INPUT, execute = execFile
   assert(typeof env.GH_TOKEN === 'string' && env.GH_TOKEN.length > 0, 'Read-only own-repository GitHub token required.');
   mkdirSync(root, { recursive: true });
   const api = (id, binary, max) => execute('gh', ['api', ...(binary ? ['-H', 'Accept: application/octet-stream'] : []), `repos/${REPOSITORY}/releases/assets/${id}`], { timeout: 180000, maxBuffer: max, stdio: ['ignore', 'pipe', 'pipe'] });
-  const metadataBytes = api(identity.metadataAssetId, true, 262144);
+  const metadataBytes = api(identity.metadataAssetId, true, MAX_JSON_BYTES);
   const info = validateBuildInfo(metadataBytes, identity);
-  const metadataAsset = strictJson(api(identity.metadataAssetId, false, 262144).toString('utf8'));
+  const metadataAsset = strictJson(api(identity.metadataAssetId, false, MAX_JSON_BYTES).toString('utf8'));
   validateAsset(metadataAsset, { id: identity.metadataAssetId, name: 'build-info.json', size: metadataBytes.length, digest: identity.metadataSha256 });
-  const apkAsset = strictJson(api(identity.apkAssetId, false, 262144).toString('utf8'));
+  const apkAsset = strictJson(api(identity.apkAssetId, false, MAX_JSON_BYTES).toString('utf8'));
   validateAsset(apkAsset, { id: identity.apkAssetId, name: ASSET_NAME, size: info.apkBytes, digest: identity.apkSha256 });
   const apk = api(identity.apkAssetId, true, 512 * 1024 ** 2);
   assert(apk.length === info.apkBytes && sha(apk) === identity.apkSha256 && apk.subarray(0, 4).equals(Buffer.from([80, 75, 3, 4])), 'Downloaded APK bytes differ.');
@@ -308,7 +309,7 @@ export function buildFixture({ env = process.env, output = OUTPUT, execute = exe
 
 export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT, baselineRoot = 'artifacts/baseline', execute = execFileSync, now = Date.now, pause = sleep, output = (text) => process.stdout.write(text) } = {}) {
   const os = runner(env); const identity = inputIdentity(env);
-  const info = validateBuildInfo(regular(join(input, 'build-info.json'), 262144), identity);
+  const info = validateBuildInfo(regular(join(input, 'build-info.json'), MAX_JSON_BYTES), identity);
   const apkPath = resolve(input, ASSET_NAME); const apk = regular(apkPath, 512 * 1024 ** 2);
   assert(apk.length === info.apkBytes && sha(apk) === identity.apkSha256, 'Local selected APK differs.');
   mkdirSync(root, { recursive: true }); const files = []; const stages = []; let sequence = 0;
@@ -354,9 +355,9 @@ export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT
   };
   const grant = (kind) => shell('am', 'start', '-W', '-n', `${HELPER}/.GrantActivity`, '--es', 'fixture', kind);
   try {
-    const baseline = strictJson(regular(join(baselineRoot, 'result.json'), 262144).toString('utf8'));
+    const baseline = strictJson(regular(join(baselineRoot, 'result.json'), MAX_JSON_BYTES).toString('utf8'));
     assert(baseline.status === 'passed' && baseline.scope === 'real-emulator-os-only-no-app-acceptance' && baseline.commit === env.GITHUB_SHA && baseline.runId === env.GITHUB_RUN_ID && baseline.api === os.api && baseline.pageSize === os.pageSize, 'Fresh unchanged OS baseline must pass in this exact job before app acceptance.');
-    store('selected-build-info.json', regular(join(input, 'build-info.json'), 262144)); store('selected-input.json', JSON.stringify(identity, null, 2));
+    store('selected-build-info.json', regular(join(input, 'build-info.json'), MAX_JSON_BYTES)); store('selected-input.json', JSON.stringify(identity, null, 2));
     const tools = join(env.ANDROID_HOME, 'build-tools', '37.0.0');
     const signature = execute(join(tools, 'apksigner'), ['verify', '--verbose', '--print-certs', apkPath], { timeout: 30000, maxBuffer: 1048576 }).toString('utf8');
     assert(signingCertificate(signature) === info.signingCertificateSha256, 'Actual selected APK signing certificate differs.'); store('apk-signature.txt', signature);
