@@ -10,6 +10,7 @@ export const REPOSITORY = 'anymize-GmbH/downloads';
 export const APP = 'ai.anymize.mobile';
 export const HELPER = 'ai.anymize.smokefixture';
 export const PHRASE = 'ANYMIZE_SMOKE_731';
+export const SECOND_PHRASE = 'ANYMIZE_SMOKE_942';
 const ASSET_NAME = 'anymize-preview-debug-signed.apk';
 const MAX_JSON_BYTES = 1024 * 1024;
 const INPUT = 'artifacts/android-app-input';
@@ -91,8 +92,9 @@ export function fetchInput({ env = process.env, root = INPUT, execute = execFile
 }
 
 /** Original public-domain synthetic PDF, independent of the application renderer. */
-export function fixturePdf() {
-  const stream = `q\n1 0.03 0.10 rg\n70 110 32 32 re f\n0.05 0.13 1 rg\n170 110 32 32 re f\nQ\nBT /F1 13 Tf 24 170 Td (${PHRASE}) Tj 0 -20 Td (Synthetic local PDF. No personal data.) Tj ET\n`;
+export function fixturePdf(phrase = PHRASE) {
+  assert([PHRASE, SECOND_PHRASE].includes(phrase), 'Only fixed synthetic search phrases are permitted.');
+  const stream = `q\n1 0.03 0.10 rg\n70 110 32 32 re f\n0.05 0.13 1 rg\n170 110 32 32 re f\nQ\nBT /F1 13 Tf 24 170 Td (${phrase}) Tj 0 -20 Td (Synthetic local PDF. No personal data.) Tj ET\n`;
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
     '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
@@ -244,6 +246,14 @@ export function assertRuntimeHealthy(events, system, runtime, packageName = APP)
   assert(!new RegExp(`Process: ${packageName.replaceAll('.', '\\.')}\\b`).test(runtime) && !/\bFATAL EXCEPTION\b|\bFatal signal\s+\d/i.test(runtime), 'Actual AndroidRuntime crash observed.');
 }
 
+export function validateNativeEdges(result, identity) {
+  assert(result?.schemaVersion === 1 && result.status === 'passed' && result.scope === 'real-granted-provider-and-intent-lifecycle-only' && result.apkSha256 === identity.apkSha256 && result.appSourceCommit === identity.sourceCommit && Array.isArray(result.cases) && result.cases.length === 2, 'Incomplete real native edge receipt.');
+  const [intent, stalled] = result.cases;
+  assert(intent.id === 'cold-a-warm-b-foreground' && intent.status === 'passed' && /^[1-9]\d*$/.test(intent.coldPid ?? '') && intent.foregroundPid === intent.coldPid && intent.activeFile === 'anymize-smoke-second.pdf' && intent.activePhrase === SECOND_PHRASE && intent.hubOriginalCount === 1 && intent.hubSecondCount === 1, 'Cold/warm/foreground PDF identity or duplicate-file proof failed.');
+  assert(stalled.id === 'stalled-provider-preserves-b-and-recovers' && stalled.status === 'passed' && Number.isSafeInteger(stalled.noticeAfterMs) && stalled.noticeAfterMs >= 28000 && stalled.noticeAfterMs <= 45000 && stalled.priorFile === intent.activeFile && stalled.priorPhrase === SECOND_PHRASE && stalled.priorPdfRetained === true && stalled.recoveryFile === 'anymize-smoke-fixture.pdf' && stalled.recoveryPhrase === PHRASE, 'Real 30-second bounded provider recovery proof failed.');
+  return result;
+}
+
 function disposableRunner(env) {
   assert(env.GITHUB_ACTIONS === 'true' && env.RUNNER_ENVIRONMENT === 'github-hosted' && env.RUNNER_OS === 'Linux' && env.GITHUB_REPOSITORY === REPOSITORY && hex(env.GITHUB_SHA, 40) && positiveId(env.GITHUB_RUN_ID), 'APK execution requires a fresh official disposable own-repository Linux runner.');
 }
@@ -281,6 +291,7 @@ export function buildFixture({ env = process.env, output = OUTPUT, execute = exe
     const compiler = invoke('javac-version', java('javac'), ['-version']).toString('utf8').trim();
     assert(/^javac 17\./.test(compiler), 'Pinned Java17 compiler required.');
     writeFileSync(join(root, 'assets', 'fixture.pdf'), fixturePdf());
+    writeFileSync(join(root, 'assets', 'fixture-second.pdf'), fixturePdf(SECOND_PHRASE));
     invoke('javac', java('javac'), ['-encoding', 'UTF-8', '-source', '17', '-target', '17', '-classpath', androidJar, '-d', join(root, 'classes'), join(FIXTURES, 'GrantActivity.java'), join(FIXTURES, 'FixtureProvider.java')]);
     invoke('classes', java('jar'), ['--create', '--file', join(root, 'classes.jar'), '-C', join(root, 'classes'), '.']);
     invoke('d8', android('d8'), ['--release', '--min-api', '35', '--lib', androidJar, '--output', join(root, 'dex'), join(root, 'classes.jar')]);
@@ -296,7 +307,7 @@ export function buildFixture({ env = process.env, output = OUTPUT, execute = exe
     const badging = invoke('badging', android('aapt2'), ['dump', 'badging', apk]).toString('utf8'); validateFixtureBadging(badging);
     invoke('manifest', android('aapt2'), ['dump', 'xmltree', apk, '--file', 'AndroidManifest.xml']);
     const apkBytes = regular(apk, 2 * 1024 ** 2);
-    const source = { fixtureSha256: sha(fixturePdf()), sources: ['AndroidManifest.xml', 'GrantActivity.java', 'FixtureProvider.java'].map((name) => ({ name, sha256: sha(regular(join(FIXTURES, name), 65536)) })), apkSha256: sha(apkBytes) };
+    const source = { fixtureSha256: sha(fixturePdf()), secondFixtureSha256: sha(fixturePdf(SECOND_PHRASE)), sources: ['AndroidManifest.xml', 'GrantActivity.java', 'FixtureProvider.java'].map((name) => ({ name, sha256: sha(regular(join(FIXTURES, name), 65536)) })), apkSha256: sha(apkBytes) };
     writeFileSync(join(output, 'fixture-source.json'), JSON.stringify(source, null, 2));
     writeFileSync(join(output, 'helper-compile-result.json'), JSON.stringify({ schemaVersion: 1, status: 'built-and-verified', scope: 'public-synthetic-helper-only-no-application-or-os-acceptance', repository: env.GITHUB_REPOSITORY, commit: env.GITHUB_SHA, runId: env.GITHUB_RUN_ID, attempt: env.GITHUB_RUN_ATTEMPT, compiler, buildTools: '37.0.0', platform: '35', package: HELPER, apkBytes: apkBytes.length, ...source, signingCertificateSha256: sha(certificate), commands }, null, 2));
     process.stdout.write(`ANDROID_SYNTHETIC_HELPER_COMPILED source=${env.GITHUB_SHA} sha256=${source.apkSha256}\n`);
@@ -328,7 +339,7 @@ export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT
     assert(activity.split(/\r?\n/).some((line) => /\b(?:mResumedActivity|topResumedActivity)\b/.test(line) && line.includes(`${APP}/`)), 'Actual application is not resumed.');
     return activity;
   };
-  const capture = (name, tree = dump(), selectedPng = null) => { health(); focused(); store(`${name}.xml`, tree.xml); const png = selectedPng ? store(`${name}.png`, selectedPng) : screenshot(`${name}.png`); stages.push({ name, at: new Date(now()).toISOString() }); return { ...tree, png }; };
+  const capture = (name, tree = dump(), selectedPng = null, primaryStage = true) => { health(); focused(); store(`${name}.xml`, tree.xml); const png = selectedPng ? store(`${name}.png`, selectedPng) : screenshot(`${name}.png`); if (primaryStage) stages.push({ name, at: new Date(now()).toISOString() }); return { ...tree, png }; };
   const swipe = (direction) => shell('input', 'swipe', '360', direction === 'down' ? '1030' : '380', '360', direction === 'down' ? '380' : '1030', '400');
   const find = async (label, { editable = false, scroll = false, timeout = scroll ? 120000 : 45000, exact = true, packageName = APP } = {}) => {
     const until = now() + timeout; let attempts = 0;
@@ -342,18 +353,55 @@ export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT
   };
   const tap = async (label, options) => { const { node, tree } = await find(label, options); const [x1, y1, x2, y2] = node.rect; shell('input', 'tap', String(Math.floor((x1 + x2) / 2)), String(Math.floor((y1 + y2) / 2))); return tree; };
   const waitText = async (label, options = {}) => find(label, { ...options, exact: false });
-  const render = async (name, orientation) => {
+  const render = async (name, orientation, primaryStage = true) => {
     const until = now() + 60000; let attempts = 0; let last;
     while (now() < until) {
       focused(); health(); const png = screenshot(`${name}-attempt-${++attempts}.png`);
       let markers;
       try { markers = pdfMarkers(png, orientation); } catch (error) { last = error; }
-      if (markers) { store(`${name}-markers.json`, JSON.stringify(markers, null, 2)); return capture(name, dump(), png); }
+      if (markers) { store(`${name}-markers.json`, JSON.stringify(markers, null, 2)); return capture(name, dump(), png, primaryStage); }
       swipe(attempts <= 6 ? 'down' : 'up'); await pause(1200);
     }
     throw new Error(`${name}: ${last?.message ?? 'Actual PDF pixels unavailable.'}`);
   };
   const grant = (kind) => shell('am', 'start', '-W', '-n', `${HELPER}/.GrantActivity`, '--es', 'fixture', kind);
+  const searchFor = async (phrase) => {
+    await tap('Find text', { editable: true, scroll: true });
+    shell('input', 'keyevent', 'KEYCODE_MOVE_END', ...Array.from({length: 20}, () => 'KEYCODE_DEL'));
+    shell('input', 'text', phrase); shell('input', 'keyevent', 'KEYCODE_ENTER');
+    const ime = shell('dumpsys', 'input_method'); if (/mInputShown=true\b/.test(ime) || /mIsInputViewShown=true\b/.test(ime)) shell('input', 'keyevent', 'KEYCODE_BACK');
+    return waitText(`Page 1: ${phrase}`, { scroll: true });
+  };
+  const nativeEdges = async (previousPid) => {
+    const edgeStart = files.length;
+    shell('am', 'force-stop', APP);
+    assert(!shell('ps', '-A', '-o', 'PID,NAME').split(/\r?\n/).some((line) => line.trim().split(/\s+/).at(-1) === APP), 'Edge cold-start process did not stop.');
+    store('native-edge-cold-a-launch.txt', grant('original'));
+    await waitText('anymize-smoke-fixture.pdf', {timeout:120000,scroll:true}); await render('native-edge-cold-a','horizontal',false);
+    const coldPid=shell('pidof',APP); assert(/^[1-9]\d*$/.test(coldPid) && coldPid!==previousPid, 'Edge cold A did not create a fresh app process.');
+    store('native-edge-warm-b-launch.txt',grant('second'));
+    await waitText('anymize-smoke-second.pdf',{scroll:true});await searchFor(SECOND_PHRASE);await render('native-edge-warm-b','horizontal',false);
+    shell('input','keyevent','KEYCODE_HOME');await pause(1000);
+    store('native-edge-foreground-launch.txt',shell('am','start','-W','-a','android.intent.action.MAIN','-c','android.intent.category.LAUNCHER','-p',APP));
+    await waitText('anymize-smoke-second.pdf',{scroll:true});await searchFor(SECOND_PHRASE);await render('native-edge-foreground-b','horizontal',false);
+    const foregroundPid=shell('pidof',APP);assert(foregroundPid===coldPid,'Foreground test changed the app process instead of testing live intent replay.');
+    await tap('Workspace',{scroll:true});await find('anymize-smoke-fixture.pdf',{scroll:true});
+    const hub=await find('anymize-smoke-second.pdf',{scroll:true});
+    const count=(name)=>new Set(hub.tree.nodes.filter((node)=>node.package===APP && node.class==='android.widget.Button' && node.enabled==='true' && node.text===name && node.rect).map((node)=>node.rect.join(','))).size;
+    const hubOriginalCount=count('anymize-smoke-fixture.pdf'),hubSecondCount=count('anymize-smoke-second.pdf');
+    assert(hubOriginalCount===1 && hubSecondCount===1,'Cold/warm/foreground hub contains a missing or duplicated PDF.');capture('native-edge-hub-no-duplicates',hub.tree,null,false);
+    await tap('anymize-smoke-second.pdf',{scroll:true});await waitText('anymize-smoke-second.pdf',{scroll:true});await render('native-edge-before-stall-b','horizontal',false);
+    const started=now();store('native-edge-stall-launch.txt',grant('stall'));
+    const remaining=45000-(now()-started);assert(remaining>0,'Stalled provider activation exceeded deadline.');
+    const errorNotice=await find('This PDF could not be opened.',{exact:false,timeout:remaining});
+    const noticeAfterMs=now()-started;assert(noticeAfterMs>=28000 && noticeAfterMs<=45000,'Provider did not produce the actual bounded 30-second idle-timeout notice.');
+    capture('native-edge-stall-timeout',errorNotice.tree,null,false);
+    await waitText('anymize-smoke-second.pdf',{scroll:true});await searchFor(SECOND_PHRASE);await render('native-edge-retained-b','horizontal',false);
+    store('native-edge-valid-recovery-launch.txt',grant('original'));
+    await waitText('anymize-smoke-fixture.pdf',{scroll:true});await searchFor(PHRASE);await render('native-edge-valid-recovery-a','horizontal',false);
+    const result={schemaVersion:1,status:'passed',scope:'real-granted-provider-and-intent-lifecycle-only',repository:env.GITHUB_REPOSITORY,commit:env.GITHUB_SHA,runId:env.GITHUB_RUN_ID,attempt:env.GITHUB_RUN_ATTEMPT,api:os.api,apkSha256:identity.apkSha256,appSourceCommit:identity.sourceCommit,cases:[{id:'cold-a-warm-b-foreground',status:'passed',coldPid,foregroundPid,activeFile:'anymize-smoke-second.pdf',activePhrase:SECOND_PHRASE,hubOriginalCount,hubSecondCount},{id:'stalled-provider-preserves-b-and-recovers',status:'passed',noticeAfterMs,priorFile:'anymize-smoke-second.pdf',priorPhrase:SECOND_PHRASE,priorPdfRetained:true,recoveryFile:'anymize-smoke-fixture.pdf',recoveryPhrase:PHRASE}],files:files.slice(edgeStart)};
+    validateNativeEdges(result,identity);store('native-edge-result.json',JSON.stringify(result,null,2));return result;
+  };
   try {
     const baseline = strictJson(regular(join(baselineRoot, 'result.json'), MAX_JSON_BYTES).toString('utf8'));
     assert(baseline.status === 'passed' && baseline.scope === 'real-emulator-os-only-no-app-acceptance' && baseline.commit === env.GITHUB_SHA && baseline.runId === env.GITHUB_RUN_ID && baseline.api === os.api && baseline.pageSize === os.pageSize, 'Fresh unchanged OS baseline must pass in this exact job before app acceptance.');
@@ -409,16 +457,18 @@ export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT
     await waitText('anymize-smoke-saved.pdf', { timeout: 120000 }); await render('07-relaunched-saved-pdf', 'vertical');
     const secondPid = shell('pidof', APP); assert(/^[1-9]\d*$/.test(secondPid) && secondPid !== firstPid, 'Relaunch did not create a fresh real app process.'); store('app-pid-after.txt', secondPid);
     assert(!new RegExp(`webview_devtools_remote_${secondPid}(?:\\s|$)`).test(shell('cat', '/proc/net/unix')), 'Relaunched release WebView debugging socket unexpectedly exposed.');
+    const nativeEdgeResult=await nativeEdges(secondPid);
     store('wifi-enable.txt', shell('svc', 'wifi', 'enable')); store('data-enable.txt', shell('svc', 'data', 'enable'));
     await tap('Workspace', { scroll: true }); await tap('Chat', { scroll: true });
     const login = await find('Email', { editable: true, exact: false, timeout: 120000, scroll: true });
     const loginText = login.tree.nodes.filter((node) => node.package === APP).map((node) => `${node.text ?? ''} ${node['content-desc'] ?? ''}`).join('\n');
     assert(/sign in|log in|anmelden/i.test(loginText) && /google|microsoft|continue|weiter|fortfahren/i.test(loginText), 'Actual public hosted login form controls are incomplete.');
     capture('08-public-hosted-login-form', login.tree);
-    assert(!new RegExp(`webview_devtools_remote_${secondPid}(?:\\s|$)`).test(shell('cat', '/proc/net/unix')), 'Cloud release WebView debugging socket unexpectedly exposed.');
+    const finalPid=shell('pidof',APP);assert(finalPid===nativeEdgeResult.cases[0].coldPid,'App process changed after native edge proof.');
+    assert(!new RegExp(`webview_devtools_remote_${finalPid}(?:\\s|$)`).test(shell('cat', '/proc/net/unix')), 'Cloud release WebView debugging socket unexpectedly exposed.');
     const finalHealth = health(); for (const [name, value] of Object.entries(finalHealth)) store(`final-${name}.txt`, value);
     store('final-activities.txt', focused());
-    const result = { schemaVersion: 1, scope: 'real-current-apk-local-pdf-and-public-login-form-only', status: 'passed', ...os, repository: env.GITHUB_REPOSITORY, commit: env.GITHUB_SHA, runId: env.GITHUB_RUN_ID, attempt: env.GITHUB_RUN_ATTEMPT, appSourceCommit: identity.sourceCommit, buildRunId: String(info.runId), apkSha256: identity.apkSha256, metadataSha256: identity.metadataSha256, versionName: info.versionName, versionCode: info.versionCode, applicationId: APP, signingCertificateSha256: info.signingCertificateSha256, uid: Number(uidMatch[1]), initialPid: firstPid, relaunchedPid: secondPid, offlinePdf: true, authenticatedAccountAcceptance: false, capturedAt: new Date(now()).toISOString(), stages, files: [...files] };
+    const result = { schemaVersion: 1, scope: 'real-current-apk-local-pdf-and-public-login-form-only', status: 'passed', ...os, repository: env.GITHUB_REPOSITORY, commit: env.GITHUB_SHA, runId: env.GITHUB_RUN_ID, attempt: env.GITHUB_RUN_ATTEMPT, appSourceCommit: identity.sourceCommit, buildRunId: String(info.runId), apkSha256: identity.apkSha256, metadataSha256: identity.metadataSha256, versionName: info.versionName, versionCode: info.versionCode, applicationId: APP, signingCertificateSha256: info.signingCertificateSha256, uid: Number(uidMatch[1]), initialPid: firstPid, relaunchedPid: secondPid, finalPid, nativeEdges:'passed-separate-native-edge-result', offlinePdf: true, authenticatedAccountAcceptance: false, capturedAt: new Date(now()).toISOString(), stages, files: [...files] };
     store('result.json', JSON.stringify(result, null, 2)); output(`ANDROID_APP_SMOKE_PASSED api=${os.api} apk=${identity.apkSha256}\n`); return result;
   } catch (error) {
     const diagnosticErrors = [];

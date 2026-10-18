@@ -10,7 +10,8 @@ import android.os.Bundle;
 public final class GrantActivity extends Activity {
   @Override public void onCreate(Bundle state) {
     super.onCreate(state);
-    String selected = "saved".equals(getIntent().getStringExtra("fixture")) ? "saved" : "original";
+    String selected = getIntent().getStringExtra("fixture");
+    if (!"saved".equals(selected) && !"second".equals(selected) && !"stall".equals(selected)) selected = "original";
     Uri uri = Uri.parse("content://ai.anymize.smokefixture.pdf/" + selected);
     Intent view = new Intent(Intent.ACTION_VIEW);
     view.setDataAndType(uri, "application/pdf");

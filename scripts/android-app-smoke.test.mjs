@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { APP, HELPER, REPOSITORY, PHRASE, strictJson, inputIdentity, validateBuildInfo, validateAsset, fetchInput, fixturePdf, inspectSavedPdf, pngCrc, decodePng, pdfMarkers, uiNodes, selectNode, validateInstalledPackage, installedApkPath, signingCertificate, validateFixtureBadging, buildFixture, assertRuntimeHealthy, runSmoke } from './android-app-smoke.mjs';
+import { APP, HELPER, REPOSITORY, PHRASE, SECOND_PHRASE, strictJson, inputIdentity, validateBuildInfo, validateAsset, fetchInput, fixturePdf, inspectSavedPdf, pngCrc, decodePng, pdfMarkers, uiNodes, selectNode, validateInstalledPackage, installedApkPath, signingCertificate, validateFixtureBadging, buildFixture, validateNativeEdges, assertRuntimeHealthy, runSmoke } from './android-app-smoke.mjs';
 
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const apk = Buffer.alloc(1024 * 1024, 23); apk.set([80,75,3,4]);
@@ -75,6 +75,7 @@ test('synthetic PDF has correct xref byte offsets, one page and known text', () 
   const rows=[...text.matchAll(/^(\d{10}) 00000 n $/gm)]; assert.equal(rows.length,5);
   rows.forEach((row,index)=>assert.equal(text.slice(Number(row[1]),Number(row[1])+7),`${index+1} 0 obj`));
   assert.throws(()=>inspectSavedPdf(pdf),/new bounded PDF/);
+  assert.ok(fixturePdf(SECOND_PHRASE).includes(Buffer.from(SECOND_PHRASE)));assert.ok(!fixturePdf(SECOND_PHRASE).equals(pdf));assert.throws(()=>fixturePdf('arbitrary input'));
 });
 
 function rotatedPdf(compressed=false) {
@@ -208,15 +209,23 @@ test('public helper exposes only a read-only granted synthetic provider and no p
   assert.match(manifest,/<provider[^>]*android:exported="false"[^>]*android:grantUriPermissions="true"/);assert.match(manifest,/android:testOnly="true"/);assert.ok(!manifest.includes('uses-permission'));
   assert.match(provider,/if \(!"r"\.equals\(mode\)\)/);assert.match(provider,/"\/original"\.equals/);assert.match(provider,/"\/saved"\.equals/);assert.match(provider,/MODE_READ_ONLY/);
   assert.match(grant,/FLAG_GRANT_READ_URI_PERMISSION/);assert.match(grant,/setClipData/);assert.match(grant,/setPackage\("ai.anymize.mobile"\)/);
+  assert.match(provider,/CancellationSignal signal/);assert.match(provider,/signal\.throwIfCanceled\(\)/);assert.match(provider,/SystemClock\.elapsedRealtime\(\) \+ 60000/);assert.match(provider,/"\/stall"\.equals/);assert.match(provider,/fixture-second\.pdf/);
   for(const content of [manifest,provider,grant])for(const bad of ['INTERNET','http://app.','https://','setWebContentsDebuggingEnabled','FileProvider.getUriForFile','@nucleo','cookie','access_token'])assert.ok(!content.includes(bad));
 });
 
-function simulatedDevice({ anrAfterRotate=false, wrongInstalledApk=false }={}) {
+test('native edge receipt requires exactly two ordered cases, stable foreground B and a genuine bounded idle timeout',()=>{
+  const value={schemaVersion:1,status:'passed',scope:'real-granted-provider-and-intent-lifecycle-only',apkSha256:env.APK_SHA256,appSourceCommit:env.APP_SOURCE_COMMIT,cases:[{id:'cold-a-warm-b-foreground',status:'passed',coldPid:'1234',foregroundPid:'1234',activeFile:'anymize-smoke-second.pdf',activePhrase:SECOND_PHRASE,hubOriginalCount:1,hubSecondCount:1},{id:'stalled-provider-preserves-b-and-recovers',status:'passed',noticeAfterMs:31000,priorFile:'anymize-smoke-second.pdf',priorPhrase:SECOND_PHRASE,priorPdfRetained:true,recoveryFile:'anymize-smoke-fixture.pdf',recoveryPhrase:PHRASE}]};
+  validateNativeEdges(value,inputIdentity(env));
+  for(const mutate of [(x)=>x.cases.reverse(),(x)=>x.cases.push(x.cases[0]),(x)=>{x.cases[0].hubOriginalCount=2;},(x)=>{x.cases[0].foregroundPid='9999';},(x)=>{x.cases[0].activePhrase=PHRASE;},(x)=>{x.cases[1].noticeAfterMs=1000;},(x)=>{x.cases[1].noticeAfterMs=45001;},(x)=>{x.cases[1].priorPdfRetained=false;},(x)=>{x.cases[1].recoveryPhrase=SECOND_PHRASE;}]){const copy=structuredClone(value);mutate(copy);assert.throws(()=>validateNativeEdges(copy,inputIdentity(env)));}
+});
+
+function simulatedDevice({ anrAfterRotate=false, wrongInstalledApk=false, replayAOnForeground=false, stallNoticeAfterMs=30000, rejectRecovery=false }={}) {
   const directory=mkdtempSync(join(tmpdir(),'anymize-smoke-orchestrator-')); const input=join(directory,'input');const root=join(directory,'output');const baselineRoot=join(directory,'baseline');
   mkdirSync(input);mkdirSync(baselineRoot);writeFileSync(join(input,info.apk),apk);writeFileSync(join(input,'build-info.json'),raw);
   const runtimeEnv={...env,GITHUB_ACTIONS:'true',RUNNER_ENVIRONMENT:'github-hosted',RUNNER_OS:'Linux',GITHUB_SHA:'c'.repeat(40),GITHUB_RUN_ID:'56789',GITHUB_RUN_ATTEMPT:'1',EXPECTED_API:'37',EXPECTED_PAGE_SIZE:'16384',EXPECTED_IMAGE:'google_apis_ps16k',ANDROID_HOME:'/synthetic-sdk'};
   writeFileSync(join(baselineRoot,'result.json'),JSON.stringify({status:'passed',scope:'real-emulator-os-only-no-app-acceptance',commit:runtimeEnv.GITHUB_SHA,runId:runtimeEnv.GITHUB_RUN_ID,api:'37',pageSize:'16384'}));
-  const model={mode:'hub',rotated:false,searched:false,relaunched:false,running:true,offlineReads:0,clock:1700000000000,controls:new Map(),calls:[],grantWhileOffline:0};
+  const model={mode:'hub',rotated:false,searched:false,query:'',kind:'original',documents:new Set(),stalledAt:null,stalledOnce:false,forceStops:0,relaunched:false,running:true,offlineReads:0,clock:1700000000000,controls:new Map(),calls:[],grantWhileOffline:0};
+  const filename=()=>model.kind==='saved'?'anymize-smoke-saved.pdf':model.kind==='second'?'anymize-smoke-second.pdf':'anymize-smoke-fixture.pdf';
   const pngHorizontal=syntheticPng(),pngVertical=syntheticPng({vertical:true}),blank=syntheticPng({blank:true});
   const tree=()=>{
     model.controls.clear();let index=0;
@@ -224,10 +233,10 @@ function simulatedDevice({ anrAfterRotate=false, wrongInstalledApk=false }={}) {
       const y=20+index++*60;model.controls.set(`110,${y+20}`,label);
       return `<node text="${label}" content-desc="" package="${packageName}" class="android.widget.${edit?'EditText':'Button'}" enabled="true" clickable="true" bounds="[10,${y}][210,${y+40}]"/>`;
     };
-    if(model.mode==='hub')return hierarchy(node('Your workspace')+node('Chat'));
+    if(model.mode==='hub')return hierarchy(node('Your workspace')+node('Chat')+[...model.documents].map((name)=>node(name)).join(''));
     if(model.mode==='auth')return hierarchy(node('Email address',{edit:true})+node('Sign in')+node('Continue with Google'));
     if(model.mode==='picker')return hierarchy(node('Downloads',{packageName:'com.android.documentsui'})+node('Save',{packageName:'com.android.documentsui'}));
-    return hierarchy(node(model.relaunched?'anymize-smoke-saved.pdf':'anymize-smoke-fixture.pdf')+node(model.rotated?'Unsaved changes':'Unchanged file')+node('Find text',{edit:true})+node('Rotate page')+node('Save a copy')+node('Workspace')+(model.searched?node(`Page 1: ${PHRASE} synthetic local PDF`):'')+(model.mode==='saved'?node('Copy saved'):''));
+    return hierarchy(node(filename())+node(model.rotated?'Unsaved changes':'Unchanged file')+node('Find text',{edit:true})+node('Rotate page')+node('Save a copy')+node('Workspace')+(model.searched?node(`Page 1: ${model.query} synthetic local PDF`):'')+(model.mode==='saved'?node('Copy saved'):'')+(model.stalledAt!==null&&model.clock-model.stalledAt>=stallNoticeAfterMs?node('This PDF could not be opened. Choose a local PDF.'):''));
   };
   const execute=(file,args)=>{
     model.clock+=20;model.calls.push([file,[...args]]);
@@ -244,25 +253,28 @@ function simulatedDevice({ anrAfterRotate=false, wrongInstalledApk=false }={}) {
     if(joined===`pm list packages -U ${APP}`)return Buffer.from(`package:${APP} uid:10123`);
     if(joined===`pm path ${APP}`)return Buffer.from(`package:/data/app/~~A_b==/${APP}-C_D==/base.apk`);
     if(joined==='dumpsys activity activities')return Buffer.from(`mResumedActivity: ActivityRecord{${APP}/.MainActivity}`);
-    if(joined===`pidof ${APP}`)return Buffer.from(model.relaunched?'5432':'4321');
+    if(joined===`pidof ${APP}`)return Buffer.from(model.forceStops>=2?'6543':model.relaunched?'5432':'4321');
     if(joined==='cat /proc/net/unix')return Buffer.from('Num RefCount Protocol Flags Type St Inode Path');
     if(cmd[0]==='svc')return Buffer.from('');
     if(joined==='dumpsys connectivity')return Buffer.from(++model.offlineReads===1?'Active default network: 123':'Active default network: none');
     if(joined==='dumpsys input_method')return Buffer.from('mInputShown=false');
     if(cmd[0]==='uiautomator')return Buffer.from('UI hierarchy dumped');
     if(joined==='cat /sdcard/anymize-app-smoke.xml')return Buffer.from(tree());
-    if(cmd[0]==='am'&&cmd[1]==='force-stop'){model.running=false;return Buffer.from('');}
+    if(cmd[0]==='am'&&cmd[1]==='force-stop'){model.running=false;model.forceStops++;model.documents.clear();model.query='';model.searched=false;return Buffer.from('');}
     if(cmd[0]==='ps')return Buffer.from(model.running?`PID NAME\n4321 ${APP}`:'PID NAME\n555 ai.anymize.smokefixture');
     if(cmd[0]==='am'&&cmd[1]==='start'){
-      if(cmd.includes('fixture')){assert.ok(model.offlineReads>=2);model.grantWhileOffline++;model.mode='viewer';model.running=true;if(cmd.at(-1)==='saved')model.relaunched=true;}
-      else model.mode='hub';
+      if(cmd.includes('fixture')){
+        assert.ok(model.offlineReads>=2);model.grantWhileOffline++;const kind=cmd.at(-1);
+        if(kind==='stall'){model.stalledAt=model.clock;model.stalledOnce=true;}
+        else if(!(rejectRecovery&&model.stalledOnce&&kind==='original')){model.mode='viewer';model.running=true;model.kind=kind;model.rotated=kind==='saved';model.searched=false;model.stalledAt=null;if(kind==='saved')model.relaunched=true;model.documents.add(filename());}
+      }else if(replayAOnForeground&&model.forceStops>=2){model.kind='original';model.searched=false;model.query='';}
       return Buffer.from('Status: ok');
     }
     if(cmd[0]==='input'){
       if(cmd[1]==='tap'){
         const label=model.controls.get(`${cmd[2]},${cmd[3]}`);assert.ok(label,`Unexpected tap ${joined}`);
-        if(label==='Rotate page')model.rotated=true;else if(label==='Save a copy')model.mode='picker';else if(label==='Save')model.mode='saved';else if(label==='Workspace')model.mode='hub';else if(label==='Chat')model.mode='auth';
-      }else if(cmd[1]==='keyevent'&&cmd.includes('KEYCODE_ENTER'))model.searched=true;
+        if(label==='Rotate page')model.rotated=true;else if(label==='Save a copy')model.mode='picker';else if(label==='Save')model.mode='saved';else if(label==='Workspace')model.mode='hub';else if(label==='Chat')model.mode='auth';else if(label==='anymize-smoke-second.pdf'){model.kind='second';model.mode='viewer';model.rotated=false;model.searched=false;}
+      }else if(cmd[1]==='text')model.query=cmd[2];else if(cmd[1]==='keyevent'&&cmd.includes('KEYCODE_DEL')){model.query='';model.searched=false;}else if(cmd[1]==='keyevent'&&cmd.includes('KEYCODE_ENTER'))model.searched=true;
       return Buffer.from('');
     }
     if(['rm','chmod','run-as'].includes(cmd[0]))return Buffer.from('');
@@ -277,7 +289,9 @@ test('orchestration simulation covers delayed offline state, genuine picker pack
     const result=await runSmoke(simulation.options);
     assert.equal(result.status,'passed');assert.equal(result.authenticatedAccountAcceptance,false);assert.equal(result.offlinePdf,true);
     assert.equal(result.initialPid,'4321');assert.equal(result.relaunchedPid,'5432');assert.equal(result.appSourceCommit,info.sourceCommit);assert.equal(result.pageSize,'16384');
-    assert.equal(simulation.model.offlineReads,2);assert.equal(simulation.model.grantWhileOffline,2);
+    assert.equal(simulation.model.offlineReads,2);assert.equal(simulation.model.grantWhileOffline,6);assert.equal(result.stages.length,8);assert.ok(result.stages.every((stage)=>!stage.name.startsWith('native-edge')));
+    assert.deepEqual(result.stages.map((stage)=>stage.name),['01-local-hub','02-original-pdf','03-search-match','04-rotated-pdf','05-save-picker','06-saved-notice','07-relaunched-saved-pdf','08-public-hosted-login-form']);
+    const edges=JSON.parse(readFileSync(join(simulation.root,'native-edge-result.json'),'utf8'));validateNativeEdges(edges,inputIdentity(env));assert.equal(edges.cases.length,2);assert.equal(edges.cases[1].noticeAfterMs>=30000,true);
     assert.ok(result.files.some((file)=>file.name==='saved-copy.pdf'&&file.sha256===hash(rotatedPdf())));
     for(const file of result.files){const bytes=readFileSync(join(simulation.root,file.name));assert.equal(bytes.length,file.bytes);assert.equal(hash(bytes),file.sha256);}
     assert.ok(!simulation.model.calls.some(([,args])=>args.includes('logcat')&&args.includes('-c')));
@@ -299,4 +313,18 @@ test('orchestration simulation rejects substituted installed bytes before any ap
     await assert.rejects(runSmoke(simulation.options),/Installed device APK bytes differ/);
     const failure=JSON.parse(readFileSync(join(simulation.root,'failure.json'),'utf8'));assert.equal(failure.status,'failed');assert.equal(failure.stages.length,0);assert.equal(simulation.model.grantWhileOffline,0);
   } finally{rmSync(simulation.directory,{recursive:true,force:true});}
+});
+
+test('orchestration simulation rejects the old cold A intent replay on foreground',async()=>{
+  const simulation=simulatedDevice({replayAOnForeground:true});
+  try{await assert.rejects(runSmoke(simulation.options),/actual enabled UI control unavailable/i);const failure=JSON.parse(readFileSync(join(simulation.root,'failure.json'),'utf8'));assert.equal(failure.status,'failed');assert.equal(failure.stages.length,7);assert.ok(!failure.files.some((file)=>file.name==='native-edge-result.json'));}finally{rmSync(simulation.directory,{recursive:true,force:true});}
+});
+
+test('orchestration simulation rejects instant provider errors and a stall beyond 45 seconds',async()=>{
+  for(const delay of [0,50000]){const simulation=simulatedDevice({stallNoticeAfterMs:delay});try{await assert.rejects(runSmoke(simulation.options),delay===0?/30-second idle-timeout/:/actual enabled UI control unavailable/i);const failure=JSON.parse(readFileSync(join(simulation.root,'failure.json'),'utf8'));assert.equal(failure.status,'failed');assert.ok(!failure.files.some((file)=>file.name==='native-edge-result.json'));}finally{rmSync(simulation.directory,{recursive:true,force:true});}}
+});
+
+test('orchestration simulation rejects loss of subsequent valid provider access after the stall',async()=>{
+  const simulation=simulatedDevice({rejectRecovery:true});
+  try{await assert.rejects(runSmoke(simulation.options),/actual enabled UI control unavailable/i);const failure=JSON.parse(readFileSync(join(simulation.root,'failure.json'),'utf8'));assert.equal(failure.status,'failed');assert.ok(!failure.files.some((file)=>file.name==='native-edge-result.json'));}finally{rmSync(simulation.directory,{recursive:true,force:true});}
 });
