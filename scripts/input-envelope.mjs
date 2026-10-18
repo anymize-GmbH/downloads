@@ -20,6 +20,6 @@ export function openInputEnvelope(encrypted, metadata, commit, expectedSha, keyT
 }
 
 export function assertInputArchive(paths, types) {
-  if (!Array.isArray(paths) || paths.length < 10 || paths.length > 50000 || paths.some((path) => !path.startsWith('source/') || path.includes('\\') || /(^|\/)\.\.(\/|$)|[\x00-\x1f\x7f:]/.test(path))) throw new Error('Unsafe archive paths');
+  if (!Array.isArray(paths) || paths.length < 10 || paths.length > 100000 || paths.some((path) => !path.startsWith('source/') || path.includes('\\') || /(^|\/)\.\.(\/|$)|[\x00-\x1f\x7f:]/.test(path))) throw new Error('Unsafe archive paths');
   if (types.length !== paths.length || types.some((line) => !/^[-d]/.test(line))) throw new Error('Links and special archive members are prohibited');
 }

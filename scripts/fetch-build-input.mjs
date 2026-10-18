@@ -12,7 +12,7 @@ const asset = env.BUILD_INPUT_ASSET_ID;
 const metadataAsset = env.BUILD_INPUT_METADATA_ID;
 const expectedEncryptedSha = env.BUILD_INPUT_SHA256;
 const metadataSha256 = env.BUILD_INPUT_METADATA_SHA256;
-const keyText = env.BUILD_INPUT_DECRYPTION_KEY;
+const keyText = env.BUILD_INPUT_DECRYPTION_KEY?.trim();
 if (!['anymize-GmbH/anymize-apps', 'attractsoft/anychat'].includes(sourceRepository) || env.GITHUB_REPOSITORY !== repository || !/^[a-f0-9]{40}$/.test(env.GITHUB_SHA ?? '')
   || !/^[1-9][0-9]*$/.test(env.GITHUB_RUN_ID ?? '') || !/^[1-9][0-9]*$/.test(env.GITHUB_RUN_ATTEMPT ?? '')
   || !/^[a-f0-9]{40}$/.test(commit ?? '') || !/^[1-9][0-9]*$/.test(asset ?? '') || !/^[1-9][0-9]*$/.test(metadataAsset ?? '')
@@ -31,9 +31,9 @@ try {
   if (metadata.schemaVersion !== 1 || metadata.sourceRepository !== sourceRepository || metadata.sourceCommit !== commit
     || metadata.encryptedSha256 !== expectedEncryptedSha || !/^[a-f0-9]{64}$/.test(metadata.lockSha256 ?? '')
     || !/^[a-f0-9]{64}$/.test(metadata.plaintextSha256 ?? '') || !/^[A-Za-z0-9_-]{16}$/.test(metadata.iv ?? '')
-    || !/^[A-Za-z0-9_-]{22}$/.test(metadata.tag ?? '') || !Number.isSafeInteger(metadata.encryptedBytes) || metadata.encryptedBytes < 1 || metadata.encryptedBytes > 536870912
+    || !/^[A-Za-z0-9_-]{22}$/.test(metadata.tag ?? '') || !Number.isSafeInteger(metadata.encryptedBytes) || metadata.encryptedBytes < 1 || metadata.encryptedBytes > 1073741824
     || metadata.plaintextBytes !== metadata.encryptedBytes) throw new Error('Input metadata rejected');
-  const encrypted = download(asset, 536870912);
+  const encrypted = download(asset, 1073741824);
   const plaintext = openInputEnvelope(encrypted, metadata, commit, expectedEncryptedSha, keyText, sourceRepository);
   writeFileSync(plainFile, plaintext, { mode: 0o600 });
   const paths = execFileSync('tar', ['-tzf', plainFile], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).trim().split(/\r?\n/);
