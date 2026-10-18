@@ -4,7 +4,7 @@ import { createCipheriv, createHash, randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { openInputEnvelope, inputAad, assertInputArchive, readBoundMetadata } from './input-envelope.mjs';
 import { sourceInputFailure } from './fetch-build-input.mjs';
 
@@ -49,6 +49,39 @@ test('actual fetch entry fails closed without raw errors and never deletes a pre
   } finally {
     assert.ok(resolve(scratch).startsWith(parent + sep));
     rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('a competing archive created after fresh-root allocation survives the actual authenticated entry failure', () => {
+  const parent = resolve('.unlazy/input-envelope-fixtures'); mkdirSync(parent, { recursive: true });
+  const scratch = mkdtempSync(join(parent, 'collision-'));
+  const commit = 'b'.repeat(40), key = randomBytes(32), iv = randomBytes(12), plaintext = Buffer.from('synthetic archive collision fixture');
+  const cipher = createCipheriv('aes-256-gcm', key, iv); cipher.setAAD(inputAad(commit));
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
+  const metadata = { schemaVersion: 1, sourceRepository: 'anymize-GmbH/anymize-apps', sourceCommit: commit, encryptedBytes: encrypted.length, plaintextBytes: plaintext.length,
+    encryptedSha256: digest(encrypted), plaintextSha256: digest(plaintext), lockSha256: 'f'.repeat(64), iv: iv.toString('base64url'), tag: cipher.getAuthTag().toString('base64url') };
+  const metadataBytes = Buffer.from(JSON.stringify(metadata));
+  const preload = join(scratch, 'synthetic-io.mjs');
+  // This child has an empty allowlisted environment and no real GH execution:
+  // the exact two download calls return only these synthetic AES-GCM buffers.
+  writeFileSync(preload, `import fs from 'node:fs'; import child from 'node:child_process'; import path from 'node:path'; import { syncBuiltinESMExports } from 'node:module';
+const originalMkdir=fs.mkdirSync;
+fs.mkdirSync=(target,...args)=>{ const result=originalMkdir(target,...args); if(path.basename(target)==='private-input') fs.writeFileSync(path.join(target,'source.tgz'),'competing caller-owned archive',{flag:'wx'}); return result; };
+child.execFileSync=(program,args)=>{ if(program!=='gh') throw Error('Unexpected synthetic command'); if(args.at(-1).endsWith('/2')) return Buffer.from(${JSON.stringify(metadataBytes.toString('base64'))},'base64'); if(args.at(-1).endsWith('/1')) return Buffer.from(${JSON.stringify(encrypted.toString('base64'))},'base64'); throw Error('Unexpected synthetic asset'); };
+syncBuiltinESMExports();\n`);
+  const system = process.platform === 'win32' ? { SystemRoot: process.env.SystemRoot } : {};
+  try {
+    const result = spawnSync(process.execPath, ['--import', pathToFileURL(preload).href, fileURLToPath(new URL('./fetch-build-input.mjs', import.meta.url))], {
+      cwd: scratch, encoding: 'utf8', timeout: 10000, env: { ...system, GITHUB_REPOSITORY: 'anymize-GmbH/downloads', GITHUB_SHA: 'a'.repeat(40), GITHUB_RUN_ID: '1', GITHUB_RUN_ATTEMPT: '1',
+        ANYMIZE_EXPECTED_SOURCE_COMMIT: commit, BUILD_INPUT_ASSET_ID: '1', BUILD_INPUT_METADATA_ID: '2', BUILD_INPUT_SHA256: metadata.encryptedSha256,
+        BUILD_INPUT_METADATA_SHA256: digest(metadataBytes), BUILD_INPUT_DECRYPTION_KEY: key.toString('base64url'), GH_TOKEN: 'synthetic-not-a-real-token' },
+    });
+    assert.equal(result.status, 1); assert.equal(result.stdout, '');
+    assert.equal(result.stderr, 'Source input rejected [archive-write:rejected].\n');
+    assert.equal(readFileSync(join(scratch, 'private-input/source.tgz'), 'utf8'), 'competing caller-owned archive');
+  } finally {
+    assert.ok(resolve(scratch).startsWith(parent + sep)); rmSync(scratch, { recursive: true, force: true });
   }
 });
 
