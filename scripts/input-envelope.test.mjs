@@ -2,6 +2,26 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createCipheriv, createHash, randomBytes } from 'node:crypto';
 import { openInputEnvelope, inputAad, assertInputArchive, readBoundMetadata } from './input-envelope.mjs';
+import { sourceInputFailure } from './fetch-build-input.mjs';
+
+test('public fetch diagnostics identify only fixed stages and bounded HTTP categories without private child output', () => {
+  const privateText = 'PRIVATE_SOURCE_PATH/private-secret.ts session=NEVER_LOG_THIS_KEY';
+  for (const status of ['401', '403', '404', '429', '500', '502', '503', '504']) {
+    const error = { stderr: Buffer.from(`gh: ${privateText} (HTTP ${status})`), message: privateText, stack: privateText };
+    assert.equal(sourceInputFailure('metadata-download', error), `Source input rejected [metadata-download:http-${status}].\n`);
+    assert.equal(sourceInputFailure('ciphertext-download', error), `Source input rejected [ciphertext-download:http-${status}].\n`);
+  }
+  assert.equal(sourceInputFailure('metadata-download', { stderr: 'HTTP 418: ' + privateText }), 'Source input rejected [metadata-download:http-other].\n');
+  assert.equal(sourceInputFailure('ciphertext-download', { code: 'ETIMEDOUT', stderr: privateText }), 'Source input rejected [ciphertext-download:timeout].\n');
+  assert.equal(sourceInputFailure('ciphertext-download', { code: 'ENOBUFS', stderr: privateText }), 'Source input rejected [ciphertext-download:size-limit].\n');
+  assert.equal(sourceInputFailure('source-identity', { stderr: 'HTTP 404: ' + privateText }), 'Source input rejected [source-identity:rejected].\n');
+  assert.equal(sourceInputFailure('metadata-download', { stderr: 'x'.repeat(8192) + ' HTTP 404' }), 'Source input rejected [metadata-download:rejected].\n');
+  for (const stage of [privateText, 'metadata-download\n::error::' + privateText, undefined]) {
+    const output = sourceInputFailure(stage, { stderr: privateText, message: privateText });
+    assert.equal(output, 'Source input rejected [internal:rejected].\n');
+    assert.equal(output.includes(privateText), false);
+  }
+});
 
 test('exact operator metadata digest binds the private diagnostic recipient before parsing', () => {
   const record = { sourceCommit: 'a'.repeat(40), logPublicKey: 'synthetic-operator-public-key' };
