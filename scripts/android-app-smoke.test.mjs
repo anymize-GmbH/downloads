@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { APP, HELPER, REPOSITORY, PHRASE, SECOND_PHRASE, strictJson, inputIdentity, validateBuildInfo, validateAsset, fetchInput, fixturePdf, inspectSavedPdf, pngCrc, decodePng, pdfMarkers, uiNodes, selectNode, validateInstalledPackage, installedApkPath, signingCertificate, validateFixtureBadging, buildFixture, validateNativeEdges, assertRuntimeHealthy, runSmoke } from './android-app-smoke.mjs';
+import { APP, HELPER, REPOSITORY, PHRASE, SECOND_PHRASE, strictJson, inputIdentity, validateBuildInfo, validateAsset, fetchInput, fixturePdf, inspectSavedPdf, pngCrc, decodePng, pdfMarkers, uiNodes, selectNode, validateNativeSignIn, validateInstalledPackage, installedApkPath, signingCertificate, validateFixtureBadging, buildFixture, validateNativeEdges, assertRuntimeHealthy, runSmoke } from './android-app-smoke.mjs';
 
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const apk = Buffer.alloc(1024 * 1024, 23); apk.set([80,75,3,4]);
@@ -139,6 +139,17 @@ test('UI selectors reject ambiguous controls, external entities, duplicate attri
   for(const xml of [hierarchy(xmlNode({'text':'other'})),'<!DOCTYPE x>'+hierarchy(xmlNode()),'<hierarchy>',' '.repeat(2*1024**2+1)])assert.throws(()=>uiNodes(xml));
 });
 
+test('native sign-in requires its actual enabled first-party control and rejects provider forms', () => {
+  const button = { package: APP, text: 'Sign in with anymize', class: 'android.widget.Button', enabled: 'true', clickable: 'true', 'resource-id': 'native-sign-in-action', rect: [10,100,400,160] };
+  for (const id of ['native-sign-in-action', `${APP}:id/native-sign-in-action`]) {
+    const proof = validateNativeSignIn([{ ...button, 'resource-id': id }]);
+    assert.equal(proof.entry, 'first-party-native'); assert.equal(proof.systemBrowserAcceptance, 'not-tested'); assert.equal(proof.authenticatedAccountAcceptance, false);
+  }
+  for (const patch of [{ enabled:'false' },{ clickable:'false' },{ package:'evil.app' },{ 'resource-id':'hosted-form' },{ class:'android.webkit.WebView' },{ rect:[10,100,10,160] }]) assert.throws(() => validateNativeSignIn([{ ...button, ...patch }]));
+  for (const provider of [{ class:'android.widget.EditText', text:'Email' },{ class:'android.webkit.WebView', text:'' },{ text:'Continue with Google' },{ text:'Florentin' },{ text:'Password' }]) assert.throws(() => validateNativeSignIn([button,{ package:APP, ...provider }]));
+  assert.throws(() => validateNativeSignIn([button,{...button,rect:[10,200,400,260]}]), /Ambiguous/);
+});
+
 test('installed release metadata rejects mismatched version or native debug flag', () => {
   const installed='  versionCode=2 minSdk=24 targetSdk=36\n  versionName=0.2.0\n  flags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ]';
   validateInstalledPackage(installed,info);
@@ -219,7 +230,7 @@ test('native edge receipt requires exactly two ordered cases, stable foreground 
   for(const mutate of [(x)=>x.cases.reverse(),(x)=>x.cases.push(x.cases[0]),(x)=>{x.cases[0].hubOriginalCount=2;},(x)=>{x.cases[0].foregroundPid='9999';},(x)=>{x.cases[0].activePhrase=PHRASE;},(x)=>{x.cases[1].noticeAfterMs=1000;},(x)=>{x.cases[1].noticeAfterMs=45001;},(x)=>{x.cases[1].priorPdfRetained=false;},(x)=>{x.cases[1].recoveryPhrase=SECOND_PHRASE;}]){const copy=structuredClone(value);mutate(copy);assert.throws(()=>validateNativeEdges(copy,inputIdentity(env)));}
 });
 
-function simulatedDevice({ anrAfterRotate=false, wrongInstalledApk=false, replayAOnForeground=false, stallNoticeAfterMs=30000, rejectRecovery=false }={}) {
+function simulatedDevice({ anrAfterRotate=false, wrongInstalledApk=false, replayAOnForeground=false, stallNoticeAfterMs=30000, rejectRecovery=false, embeddedProvider=false }={}) {
   const directory=mkdtempSync(join(tmpdir(),'anymize-smoke-orchestrator-')); const input=join(directory,'input');const root=join(directory,'output');const baselineRoot=join(directory,'baseline');
   mkdirSync(input);mkdirSync(baselineRoot);writeFileSync(join(input,info.apk),apk);writeFileSync(join(input,'build-info.json'),raw);
   const runtimeEnv={...env,GITHUB_ACTIONS:'true',RUNNER_ENVIRONMENT:'github-hosted',RUNNER_OS:'Linux',GITHUB_SHA:'c'.repeat(40),GITHUB_RUN_ID:'56789',GITHUB_RUN_ATTEMPT:'1',EXPECTED_API:'37',EXPECTED_PAGE_SIZE:'16384',EXPECTED_IMAGE:'google_apis_ps16k',ANDROID_HOME:'/synthetic-sdk'};
@@ -231,10 +242,10 @@ function simulatedDevice({ anrAfterRotate=false, wrongInstalledApk=false, replay
     model.controls.clear();let index=0;
     const node=(label,{edit=false,packageName=APP}={})=>{
       const y=20+index++*60;model.controls.set(`110,${y+20}`,label);
-      return `<node text="${label}" content-desc="" package="${packageName}" class="android.widget.${edit?'EditText':'Button'}" enabled="true" clickable="true" bounds="[10,${y}][210,${y+40}]"/>`;
+      return `<node text="${label}" content-desc="" resource-id="${label==='Sign in with anymize'?'native-sign-in-action':''}" package="${packageName}" class="android.widget.${edit?'EditText':'Button'}" enabled="true" clickable="true" bounds="[10,${y}][210,${y+40}]"/>`;
     };
     if(model.mode==='hub')return hierarchy(node('Your workspace')+node('Chat')+[...model.documents].map((name)=>node(name)).join(''));
-    if(model.mode==='auth')return hierarchy(node('Email address',{edit:true})+node('Sign in')+node('Continue with Google'));
+    if(model.mode==='auth')return hierarchy(node('Sign in with anymize')+(embeddedProvider?node('Email address',{edit:true})+node('Continue with Google'):''));
     if(model.mode==='picker')return hierarchy(node('Downloads',{packageName:'com.android.documentsui'})+node('Save',{packageName:'com.android.documentsui'}));
     return hierarchy(node(filename())+node(model.rotated?'Unsaved changes':'Unchanged file')+node('Find text',{edit:true})+node('Rotate page')+node('Save a copy')+node('Workspace')+(model.searched?node(`Page 1: ${model.query} synthetic local PDF`):'')+(model.mode==='saved'?node('Copy saved'):'')+(model.stalledAt!==null&&model.clock-model.stalledAt>=stallNoticeAfterMs?node('This PDF could not be opened. Choose a local PDF.'):''));
   };
@@ -290,7 +301,8 @@ test('orchestration simulation covers delayed offline state, genuine picker pack
     assert.equal(result.status,'passed');assert.equal(result.authenticatedAccountAcceptance,false);assert.equal(result.offlinePdf,true);
     assert.equal(result.initialPid,'4321');assert.equal(result.relaunchedPid,'5432');assert.equal(result.appSourceCommit,info.sourceCommit);assert.equal(result.pageSize,'16384');
     assert.equal(simulation.model.offlineReads,2);assert.equal(simulation.model.grantWhileOffline,6);assert.equal(result.stages.length,8);assert.ok(result.stages.every((stage)=>!stage.name.startsWith('native-edge')));
-    assert.deepEqual(result.stages.map((stage)=>stage.name),['01-local-hub','02-original-pdf','03-search-match','04-rotated-pdf','05-save-picker','06-saved-notice','07-relaunched-saved-pdf','08-public-hosted-login-form']);
+    assert.deepEqual(result.stages.map((stage)=>stage.name),['01-local-hub','02-original-pdf','03-search-match','04-rotated-pdf','05-save-picker','06-saved-notice','07-relaunched-saved-pdf','08-native-sign-in-entry']);
+    assert.equal(result.scope,'real-current-apk-local-pdf-and-native-sign-in-entry-only');assert.equal(result.nativeSignInEntry.embeddedProviderForm,false);
     const edges=JSON.parse(readFileSync(join(simulation.root,'native-edge-result.json'),'utf8'));validateNativeEdges(edges,inputIdentity(env));assert.equal(edges.cases.length,2);assert.equal(edges.cases[1].noticeAfterMs>=30000,true);
     assert.ok(result.files.some((file)=>file.name==='saved-copy.pdf'&&file.sha256===hash(rotatedPdf())));
     for(const file of result.files){const bytes=readFileSync(join(simulation.root,file.name));assert.equal(bytes.length,file.bytes);assert.equal(hash(bytes),file.sha256);}
@@ -305,6 +317,17 @@ test('orchestration simulation preserves an ANR failure signal before saving or 
     const failure=JSON.parse(readFileSync(join(simulation.root,'failure.json'),'utf8'));assert.equal(failure.status,'failed');assert.ok(failure.message.includes('ANR'));assert.ok(failure.files.some((file)=>file.name.startsWith('health-failure-')));assert.equal(simulation.model.grantWhileOffline,1);
     assert.ok(!simulation.model.calls.some(([,args])=>args.includes('force-stop')));
   } finally{rmSync(simulation.directory,{recursive:true,force:true});}
+});
+
+test('orchestration rejects an embedded provider form even beside a correctly labelled native action', async () => {
+  const simulation=simulatedDevice({embeddedProvider:true});
+  try {
+    await assert.rejects(runSmoke(simulation.options), /Embedded provider credential UI/);
+    const failure=JSON.parse(readFileSync(join(simulation.root,'failure.json'),'utf8'));
+    assert.equal(failure.status,'failed');assert.equal(failure.stages.length,7);
+    assert.ok(failure.files.some((file)=>file.name==='native-edge-result.json'));
+    assert.ok(!failure.stages.some((stage)=>stage.name==='08-native-sign-in-entry'));
+  } finally { rmSync(simulation.directory,{recursive:true,force:true}); }
 });
 
 test('orchestration simulation rejects substituted installed bytes before any app operation', async () => {

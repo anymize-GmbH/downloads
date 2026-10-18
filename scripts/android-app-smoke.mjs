@@ -207,6 +207,20 @@ export function selectNode(nodes, label, { editable = false, packageName = APP, 
   return selected[0];
 }
 
+/** The public smoke proves the native entry only, never an authenticated session.
+ * A hosted provider form is deliberately a failing control for this receipt. */
+export function validateNativeSignIn(nodes) {
+  const own = nodes.filter((node) => node.package === APP);
+  const button = selectNode(own, 'Sign in with anymize');
+  assert(button && button.clickable === 'true'
+    && ['native-sign-in-action', `${APP}:id/native-sign-in-action`].includes(button['resource-id'])
+    && /^(?:android\.widget\.Button|android\.view\.View)$/.test(button.class ?? ''), 'Actual native anymize sign-in button is missing.');
+  assert(!own.some((node) => /EditText$|WebView$/.test(node.class ?? '')
+    || /florentin|continue with (?:google|microsoft)/i.test(`${node.text ?? ''} ${node['content-desc'] ?? ''}`)
+    || [node.text, node['content-desc']].some((value) => /^(?:email address|password)$/i.test(value ?? ''))), 'Embedded provider credential UI must not appear in the native sign-in entry.');
+  return { entry: 'first-party-native', action: 'Sign in with anymize', embeddedProviderForm: false, systemBrowserAcceptance: 'not-tested', authenticatedAccountAcceptance: false };
+}
+
 export function validateInstalledPackage(text, info) {
   const versions = [...text.matchAll(/^\s*versionCode=(\d+)\b/gm)]; const names = [...text.matchAll(/^\s*versionName=([^\r\n]+)$/gm)];
   assert(versions.length === 1 && Number(versions[0][1]) === info.versionCode && names.length === 1 && names[0][1].trim() === info.versionName && !/\bDEBUGGABLE\b/.test(text), 'Installed app version or release debug policy differs.');
@@ -460,15 +474,14 @@ export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT
     const nativeEdgeResult=await nativeEdges(secondPid);
     store('wifi-enable.txt', shell('svc', 'wifi', 'enable')); store('data-enable.txt', shell('svc', 'data', 'enable'));
     await tap('Workspace', { scroll: true }); await tap('Chat', { scroll: true });
-    const login = await find('Email', { editable: true, exact: false, timeout: 120000, scroll: true });
-    const loginText = login.tree.nodes.filter((node) => node.package === APP).map((node) => `${node.text ?? ''} ${node['content-desc'] ?? ''}`).join('\n');
-    assert(/sign in|log in|anmelden/i.test(loginText) && /google|microsoft|continue|weiter|fortfahren/i.test(loginText), 'Actual public hosted login form controls are incomplete.');
-    capture('08-public-hosted-login-form', login.tree);
+    const login = await find('Sign in with anymize', { timeout: 120000, scroll: true });
+    const nativeSignInEntry = validateNativeSignIn(login.tree.nodes);
+    capture('08-native-sign-in-entry', login.tree);
     const finalPid=shell('pidof',APP);assert(finalPid===nativeEdgeResult.cases[0].coldPid,'App process changed after native edge proof.');
     assert(!new RegExp(`webview_devtools_remote_${finalPid}(?:\\s|$)`).test(shell('cat', '/proc/net/unix')), 'Cloud release WebView debugging socket unexpectedly exposed.');
     const finalHealth = health(); for (const [name, value] of Object.entries(finalHealth)) store(`final-${name}.txt`, value);
     store('final-activities.txt', focused());
-    const result = { schemaVersion: 1, scope: 'real-current-apk-local-pdf-and-public-login-form-only', status: 'passed', ...os, repository: env.GITHUB_REPOSITORY, commit: env.GITHUB_SHA, runId: env.GITHUB_RUN_ID, attempt: env.GITHUB_RUN_ATTEMPT, appSourceCommit: identity.sourceCommit, buildRunId: String(info.runId), apkSha256: identity.apkSha256, metadataSha256: identity.metadataSha256, versionName: info.versionName, versionCode: info.versionCode, applicationId: APP, signingCertificateSha256: info.signingCertificateSha256, uid: Number(uidMatch[1]), initialPid: firstPid, relaunchedPid: secondPid, finalPid, nativeEdges:'passed-separate-native-edge-result', offlinePdf: true, authenticatedAccountAcceptance: false, capturedAt: new Date(now()).toISOString(), stages, files: [...files] };
+    const result = { schemaVersion: 1, scope: 'real-current-apk-local-pdf-and-native-sign-in-entry-only', status: 'passed', ...os, repository: env.GITHUB_REPOSITORY, commit: env.GITHUB_SHA, runId: env.GITHUB_RUN_ID, attempt: env.GITHUB_RUN_ATTEMPT, appSourceCommit: identity.sourceCommit, buildRunId: String(info.runId), apkSha256: identity.apkSha256, metadataSha256: identity.metadataSha256, versionName: info.versionName, versionCode: info.versionCode, applicationId: APP, signingCertificateSha256: info.signingCertificateSha256, uid: Number(uidMatch[1]), initialPid: firstPid, relaunchedPid: secondPid, finalPid, nativeEdges:'passed-separate-native-edge-result', nativeSignInEntry, offlinePdf: true, authenticatedAccountAcceptance: false, capturedAt: new Date(now()).toISOString(), stages, files: [...files] };
     store('result.json', JSON.stringify(result, null, 2)); output(`ANDROID_APP_SMOKE_PASSED api=${os.api} apk=${identity.apkSha256}\n`); return result;
   } catch (error) {
     const diagnosticErrors = [];
