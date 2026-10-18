@@ -197,6 +197,30 @@ test('wrong actual API or guest page size cannot produce a success receipt', asy
   });
 });
 
+test('SDK setup HOME can finish before the original strict launcher proof, without changing guest setup',async()=>{
+  let attempts=0;
+  await syntheticRun('35',({request})=>request.startsWith('shell cmd package resolve-activity ')&&++attempts<3?'com.google.android.googlesdksetup/.DefaultActivity':undefined,async({options,root,calls})=>{
+    const result=await runBaseline(options);assert.equal(result.status,'passed');assert.equal(result.homeComponent,HOME);
+    assert.equal(JSON.parse(readFileSync(join(root,'home-resolution-attempts.json'),'utf8')).length,3);
+    assert.ok(calls.every((call)=>!/settings put|setprop|disable-user|logcat.* -c/.test(call.request??'')));
+  });
+});
+
+test('a persistent setup HOME or an ANR during launcher resolution cannot be accepted',async()=>{
+  for(const anr of [false,true]){
+    let resolved=false;
+    await syntheticRun('35',({request})=>{
+      if(request.startsWith('shell cmd package resolve-activity ')){resolved=true;return 'com.google.android.googlesdksetup/.DefaultActivity';}
+      if(anr&&resolved&&request.startsWith('shell logcat -b events'))return 'I am_anr: [0,1017,com.android.systemui]';
+      return undefined;
+    },async({options,root,calls})=>{
+      await assert.rejects(runBaseline(options),anr?/Actual guest ANR/:/default HOME did not become ready/);
+      assert.equal(existsSync(join(root,'result.json')),false);
+      assert.ok(calls.every((call)=>!/settings put|setprop|disable-user|logcat.* -c/.test(call.request??'')));
+    });
+  }
+});
+
 test('a missing real focus times out and preserves raw focus/activity diagnostics', async () => {
   await syntheticRun('36', ({ request }) => request === 'shell dumpsys window displays' ? windowsOnly : undefined, async ({ options, root }) => {
     await assert.rejects(runBaseline(options), /Stable real launcher/);

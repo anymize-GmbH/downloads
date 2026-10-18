@@ -237,7 +237,7 @@ test('native edge receipt requires exactly two ordered cases, stable foreground 
   for(const mutate of [(x)=>x.cases.reverse(),(x)=>x.cases.push(x.cases[0]),(x)=>{x.cases[0].hubOriginalCount=2;},(x)=>{x.cases[0].foregroundPid='9999';},(x)=>{x.cases[0].activePhrase=PHRASE;},(x)=>{x.cases[1].noticeAfterMs=1000;},(x)=>{x.cases[1].noticeAfterMs=45001;},(x)=>{x.cases[1].priorPdfRetained=false;},(x)=>{x.cases[1].recoveryPhrase=SECOND_PHRASE;}]){const copy=structuredClone(value);mutate(copy);assert.throws(()=>validateNativeEdges(copy,inputIdentity(env)));}
 });
 
-function simulatedDevice({ anrAfterRotate=false, wrongInstalledApk=false, replayAOnForeground=false, stallNoticeAfterMs=30000, rejectRecovery=false, embeddedProvider=false }={}) {
+function simulatedDevice({ anrAfterRotate=false, wrongInstalledApk=false, replayAOnForeground=false, stallNoticeAfterMs=30000, rejectRecovery=false, embeddedProvider=false, busyUiDumps=0 }={}) {
   const directory=mkdtempSync(join(tmpdir(),'anymize-smoke-orchestrator-')); const input=join(directory,'input');const root=join(directory,'output');const baselineRoot=join(directory,'baseline');
   mkdirSync(input);mkdirSync(baselineRoot);writeFileSync(join(input,info.apk),apk);writeFileSync(join(input,'build-info.json'),raw);
   const runtimeEnv={...env,GITHUB_ACTIONS:'true',RUNNER_ENVIRONMENT:'github-hosted',RUNNER_OS:'Linux',GITHUB_SHA:'c'.repeat(40),GITHUB_RUN_ID:'56789',GITHUB_RUN_ATTEMPT:'1',EXPECTED_API:'37',EXPECTED_PAGE_SIZE:'16384',EXPECTED_IMAGE:'google_apis_ps16k',ANDROID_HOME:'/synthetic-sdk'};
@@ -276,7 +276,7 @@ function simulatedDevice({ anrAfterRotate=false, wrongInstalledApk=false, replay
     if(cmd[0]==='svc')return Buffer.from('');
     if(joined==='dumpsys connectivity')return Buffer.from(++model.offlineReads===1?'Active default network: 123':'Active default network: none');
     if(joined==='dumpsys input_method')return Buffer.from('mInputShown=false');
-    if(cmd[0]==='uiautomator')return Buffer.from('UI hierarchy dumped');
+    if(cmd[0]==='uiautomator')return Buffer.from(busyUiDumps-- > 0?'ERROR: could not get idle state.':'UI hierchary dumped to: /sdcard/anymize-app-smoke.xml');
     if(joined==='cat /sdcard/anymize-app-smoke.xml')return Buffer.from(tree());
     if(cmd[0]==='am'&&cmd[1]==='force-stop'){model.running=false;model.forceStops++;model.documents.clear();model.query='';model.searched=false;return Buffer.from('');}
     if(cmd[0]==='ps')return Buffer.from(model.running?`PID NAME\n4321 ${APP}`:'PID NAME\n555 ai.anymize.smokefixture');
@@ -336,6 +336,29 @@ test('orchestration rejects an embedded provider form even beside a correctly la
     assert.ok(failure.files.some((file)=>file.name==='native-edge-result.json'));
     assert.ok(!failure.stages.some((stage)=>stage.name==='08-native-sign-in-entry'));
   } finally { rmSync(simulation.directory,{recursive:true,force:true}); }
+});
+
+test('a transient non-idle native UI is retried without reading or accepting a stale hierarchy',async()=>{
+  const simulation=simulatedDevice({busyUiDumps:2});
+  try {
+    const result=await runSmoke(simulation.options);assert.equal(result.status,'passed');
+    assert.equal(result.files.filter((file)=>/^ui-not-ready-\d+\.txt$/.test(file.name)).length,2);
+    const calls=simulation.model.calls;const indexes=calls.map(([,args],index)=>args.includes('uiautomator')?index:-1).filter((index)=>index>=0);
+    for(const index of indexes.slice(0,2))assert.ok(!calls[index+1][1].includes('cat'));
+    assert.ok(calls.every(([,args])=>!args.includes('logcat')||!args.includes('-c')));
+  } finally {rmSync(simulation.directory,{recursive:true,force:true});}
+});
+
+test('a permanently unavailable UI reaches its deadline without a stage or a stale XML read',async()=>{
+  const simulation=simulatedDevice({busyUiDumps:100000});
+  try {
+    await assert.rejects(runSmoke(simulation.options),/Actual UI hierarchy is not ready/);
+    const failure=JSON.parse(readFileSync(join(simulation.root,'failure.json'),'utf8'));
+    assert.equal(failure.status,'failed');assert.equal(failure.stages.length,0);
+    assert.ok(!simulation.model.calls.some(([,args])=>args.includes('cat')&&args.includes('/sdcard/anymize-app-smoke.xml')));
+    assert.ok(!failure.files.some((file)=>file.name==='result.json'));
+    assert.ok(simulation.model.clock>=1700000000000+120000);
+  } finally {rmSync(simulation.directory,{recursive:true,force:true});}
 });
 
 test('orchestration simulation rejects substituted installed bytes before any app operation', async () => {

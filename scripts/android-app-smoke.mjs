@@ -365,7 +365,16 @@ export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT
     try { assertRuntimeHealthy(events, system, runtime); } catch (error) { store(`health-failure-${++sequence}.json`, JSON.stringify({ events, system, runtime })); throw error; }
     return { events, system, runtime };
   };
-  const dump = () => { shell('uiautomator', 'dump', '/sdcard/anymize-app-smoke.xml'); const xml = shell('cat', '/sdcard/anymize-app-smoke.xml'); return { xml, nodes: uiNodes(xml) }; };
+  const dump = () => {
+    // Never reuse an older hierarchy when UiAutomation has no idle root yet.
+    shell('rm','-f','/sdcard/anymize-app-smoke.xml');
+    const status = shell('uiautomator', 'dump', '/sdcard/anymize-app-smoke.xml');
+    if (!/UI hier(?:archy|chary) dumped to: \/sdcard\/anymize-app-smoke\.xml\s*$/.test(status) || /ERROR:/i.test(status)) {
+      store(`ui-not-ready-${++sequence}.txt`,status);
+      const error = new Error('Actual UI hierarchy is not ready');error.code='UI_NOT_READY';throw error;
+    }
+    const xml = shell('cat', '/sdcard/anymize-app-smoke.xml'); return { xml, nodes: uiNodes(xml) };
+  };
   const screenshot = (name) => { const png = adb(['exec-out', 'screencap', '-p']); decodePng(png); store(name, png); return png; };
   const focused = () => {
     const activity = shell('dumpsys', 'activity', 'activities');
@@ -377,7 +386,10 @@ export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT
   const find = async (label, { editable = false, scroll = false, timeout = scroll ? 120000 : 45000, exact = true, packageName = APP } = {}) => {
     const until = now() + timeout; let attempts = 0;
     while (now() < until) {
-      health(); const tree = dump(); const node = selectNode(tree.nodes, label, { editable, exact, packageName });
+      health(); let tree;
+      try { tree = dump(); }
+      catch (error) { if(error.code!=='UI_NOT_READY')throw error;await pause(1000);continue; }
+      const node = selectNode(tree.nodes, label, { editable, exact, packageName });
       if (node) return { node, tree };
       if (scroll && attempts < 12) swipe(attempts < 3 || attempts >= 9 ? 'up' : 'down');
       attempts++; await pause(1000);
@@ -505,7 +517,7 @@ export async function runSmoke({ env = process.env, input = INPUT, root = OUTPUT
     store('result.json', JSON.stringify(result, null, 2)); output(`ANDROID_APP_SMOKE_PASSED api=${os.api} apk=${identity.apkSha256}\n`); return result;
   } catch (error) {
     const diagnosticErrors = [];
-    for (const [name, args] of [['failure-events.txt', ['shell','logcat','-b','events','-d']], ['failure-system.txt', ['shell','logcat','-b','system','-d']], ['failure-crash.txt', ['shell','logcat','-b','crash','-d']], ['failure-activity.txt', ['shell','dumpsys','activity','activities']], ['failure-window.txt', ['shell','dumpsys','window','displays']], ['failure.png', ['exec-out','screencap','-p']]]) {
+    for (const [name, args] of [['failure-events.txt', ['shell','logcat','-b','events','-d']], ['failure-system.txt', ['shell','logcat','-b','system','-d']], ['failure-crash.txt', ['shell','logcat','-b','crash','-d']], ['failure-runtime.txt', ['shell','logcat','-b','main','-d','-t','200','-s','ReactNativeJS:E','AndroidRuntime:E','Expo:E']], ['failure-activity.txt', ['shell','dumpsys','activity','activities']], ['failure-window.txt', ['shell','dumpsys','window','displays']], ['failure.png', ['exec-out','screencap','-p']]]) {
       try { store(name, adb(args, 15000)); } catch (diagnostic) { diagnosticErrors.push({ name, message: String(diagnostic.message).slice(0, 2000) }); }
     }
     try { store('failure.xml', dump().xml); } catch (diagnostic) { diagnosticErrors.push({ name: 'failure.xml', message: String(diagnostic.message).slice(0, 2000) }); }

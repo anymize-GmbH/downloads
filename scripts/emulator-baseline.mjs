@@ -137,9 +137,25 @@ export async function runBaseline({ env = process.env, root = 'artifacts/baselin
     store('initial-events.txt', initialEvents);
     store('initial-system.txt', initialSystem);
     anrCheck(initialEvents, initialSystem);
-    const resolved = shell('cmd', 'package', 'resolve-activity', '--brief', '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.HOME');
-    store('resolved-home.txt', resolved);
-    const homeComponent = parseHomeComponent(resolved);
+    // A fresh Google image can report its SDK setup activity briefly after
+    // sys.boot_completed. Wait for its real default launcher without changing
+    // provisioning, disabling packages or accepting that setup activity.
+    let homeComponent;
+    const homeUntil = now() + 120000;
+    const homeAttempts = [];
+    while (now() < homeUntil) {
+      const resolved = shell('cmd', 'package', 'resolve-activity', '--brief', '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.HOME');
+      homeAttempts.push({ at: new Date(now()).toISOString(), resolved });
+      anrCheck(shell('logcat', '-b', 'events', '-d', '-v', 'threadtime'), shell('logcat', '-b', 'system', '-d', '-v', 'threadtime'));
+      let candidate;
+      try { candidate = parseHomeComponent(resolved); }
+      catch { await sleep(2000); continue; }
+      store('resolved-home.txt', resolved);
+      homeComponent = candidate;
+      break;
+    }
+    store('home-resolution-attempts.json', JSON.stringify(homeAttempts, null, 2));
+    if (!homeComponent) throw new Error('Actual supported default HOME did not become ready within 120 seconds');
     // The runner sends MENU to unlock, which opens a launcher popup on these
     // images. HOME is a genuine input action, not a fabricated focus signal.
     store('home-command.txt', shell('input', 'keyevent', 'KEYCODE_HOME'));
