@@ -61,8 +61,9 @@ export function parseHomeComponent(text) {
   return components[0];
 }
 
-export function assertNoAnr(events, system = '') {
+export function assertNoAnr(events, system = '', crash = '') {
   if (/\bam_anr\b/.test(events) || /\bANR in\s+/.test(system)) throw new Error('Actual guest ANR observed');
+  if (/\bam_crash\b|\bFATAL EXCEPTION:|\bFatal signal [0-9]+/.test(events + '\n' + system + '\n' + crash)) throw new Error('Actual guest crash observed');
 }
 
 export function assessBootSample({ boot, animation, pid, surfacePid, activity, displays, homeComponent }) {
@@ -86,8 +87,36 @@ export function assessBootSample({ boot, animation, pid, surfacePid, activity, d
 }
 
 export function validateLauncherXml(xml, homeComponent) {
+  const reject = () => { throw new Error('No actual enabled launcher XML'); };
+  if (typeof xml !== 'string' || Buffer.byteLength(xml) > 2 * 1024 ** 2) reject();
+  let document = xml.trim();
+  const declaration = /^<\?xml\s+version=(['"])1\.0\1(?:\s+encoding=(['"])UTF-8\2)?(?:\s+standalone=(['"])(?:yes|no)\3)?\s*\?>/.exec(document);
+  if (declaration) document = document.slice(declaration[0].length).trim();
   const packageName = homeComponent.split('/')[0];
-  if (!xml.includes('<hierarchy') || !xml.includes('</hierarchy>') || ![...xml.matchAll(/<node\b[^>]*>/g)].some(([node]) => node.includes(`package="${packageName}"`) && /\benabled="true"/.test(node))) throw new Error('No actual enabled launcher XML');
+  const stack = []; let cursor = 0, rootSeen = false, rootClosed = false, enabled = false;
+  const validPoint = (point) => [9, 10, 13].includes(point) || point >= 0x20 && point <= 0xd7ff || point >= 0xe000 && point <= 0xfffd || point >= 0x10000 && point <= 0x10ffff;
+  for (const match of document.matchAll(/<(\/?)(hierarchy|node)\b((?:"[^"]*"|'[^']*'|[^'"<>])*)>/g)) {
+    if (document.slice(cursor, match.index).trim() || rootClosed) reject();
+    cursor = match.index + match[0].length;
+    const closing = match[1] === '/', name = match[2], body = match[3];
+    if (closing) { if (body.trim() || stack.pop() !== name) reject(); if (name === 'hierarchy') rootClosed = true; continue; }
+    if (name === 'hierarchy') { if (rootSeen || stack.length) reject(); rootSeen = true; }
+    else if (!rootSeen || !stack.length) reject();
+    const selfClosing = /\/\s*$/.test(body), attributes = selfClosing ? body.replace(/\/\s*$/, '') : body;
+    const values = new Map(); let end = 0;
+    for (const attribute of attributes.matchAll(/([A-Za-z_][A-Za-z0-9_.:-]*)\s*=\s*(?:"([^"<]*)"|'([^'<]*)')/g)) {
+      if (!/^\s+$/.test(attributes.slice(end, attribute.index)) || values.has(attribute[1])) reject();
+      end = attribute.index + attribute[0].length;
+      const value = attribute[2] ?? attribute[3];
+      if (value.replace(/&(?:amp|lt|gt|quot|apos|#[0-9]+|#x[0-9a-fA-F]+);/g, '').includes('&') || [...value].some((character) => !validPoint(character.codePointAt(0)))) reject();
+      for (const entity of value.matchAll(/&#(x[0-9a-fA-F]+|[0-9]+);/g)) if (!validPoint(Number(entity[1][0] === 'x' ? '0' + entity[1] : entity[1]))) reject();
+      values.set(attribute[1], value);
+    }
+    if (attributes.slice(end).trim()) reject();
+    if (name === 'node' && values.get('package') === packageName && values.get('enabled') === 'true') enabled = true;
+    if (!selfClosing) stack.push(name); else if (name === 'hierarchy') rootClosed = true;
+  }
+  if (cursor !== document.length || stack.length || !rootSeen || !rootClosed || !enabled) reject();
 }
 
 export function validateScreenshot(png) {
@@ -109,8 +138,8 @@ export async function runBaseline({ env = process.env, root = 'artifacts/baselin
     receipts.push(receipt);
     return receipt;
   };
-  const anrCheck = (events, system = '') => {
-    try { assertNoAnr(events, system); } catch (error) { store('events-anr.txt', events); if (system) store('system-anr.txt', system); throw error; }
+  const anrCheck = (events, system = '', crash = '') => {
+    try { assertNoAnr(events, system, crash); } catch (error) { store('events-anr.txt', events); if (system) store('system-anr.txt', system); if (crash) store('crash-fatal.txt', crash); throw error; }
   };
   try {
     if (host.cpus < 4 || host.bytes < 14 * 1024 ** 3) throw new Error('Expected actual four-CPU public runner with at least 14 GiB RAM');
@@ -136,7 +165,8 @@ export async function runBaseline({ env = process.env, root = 'artifacts/baselin
     const initialSystem = shell('logcat', '-b', 'system', '-d', '-v', 'threadtime');
     store('initial-events.txt', initialEvents);
     store('initial-system.txt', initialSystem);
-    anrCheck(initialEvents, initialSystem);
+    const initialCrash = shell('logcat', '-b', 'crash', '-d', '-v', 'threadtime');
+    store('initial-crash.txt', initialCrash); anrCheck(initialEvents, initialSystem, initialCrash);
     // A fresh Google image can report its SDK setup activity briefly after
     // sys.boot_completed. Wait for its real default launcher without changing
     // provisioning, disabling packages or accepting that setup activity.
@@ -146,7 +176,7 @@ export async function runBaseline({ env = process.env, root = 'artifacts/baselin
     while (now() < homeUntil) {
       const resolved = shell('cmd', 'package', 'resolve-activity', '--brief', '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.HOME');
       homeAttempts.push({ at: new Date(now()).toISOString(), resolved });
-      anrCheck(shell('logcat', '-b', 'events', '-d', '-v', 'threadtime'), shell('logcat', '-b', 'system', '-d', '-v', 'threadtime'));
+      anrCheck(shell('logcat', '-b', 'events', '-d', '-v', 'threadtime'), shell('logcat', '-b', 'system', '-d', '-v', 'threadtime'), shell('logcat', '-b', 'crash', '-d', '-v', 'threadtime'));
       let candidate;
       try { candidate = parseHomeComponent(resolved); }
       catch { await sleep(2000); continue; }
@@ -164,16 +194,16 @@ export async function runBaseline({ env = process.env, root = 'artifacts/baselin
     let previousSurfacePid = '';
     let accepted = false;
     const until = now() + 180000;
-    const capture = () => {
-      const boot = shell('getprop', 'sys.boot_completed');
-      const animation = shell('getprop', 'init.svc.bootanim');
-      const pid = shell('pidof', 'com.android.systemui');
-      const surfacePid = shell('pidof', 'surfaceflinger');
-      const activity = shell('dumpsys', 'activity', 'activities');
+    const capture = (command = shell) => {
+      const boot = command('getprop', 'sys.boot_completed');
+      const animation = command('getprop', 'init.svc.bootanim');
+      const pid = command('pidof', 'com.android.systemui');
+      const surfacePid = command('pidof', 'surfaceflinger');
+      const activity = command('dumpsys', 'activity', 'activities');
       // AOSP's "windows" subcommand omits DisplayContent's focus fields.
-      const displays = shell('dumpsys', 'window', 'displays');
-      const events = shell('logcat', '-b', 'events', '-d', '-v', 'threadtime');
-      anrCheck(events);
+      const displays = command('dumpsys', 'window', 'displays');
+      const events = command('logcat', '-b', 'events', '-d', '-v', 'threadtime');
+      anrCheck(events, command('logcat', '-b', 'system', '-d', '-v', 'threadtime'), command('logcat', '-b', 'crash', '-d', '-v', 'threadtime'));
       const state = assessBootSample({ boot, animation, pid, surfacePid, activity, displays, homeComponent });
       observations.push({ at: new Date(now()).toISOString(), boot, animation, pid, surfacePid, launcher: state.launcher, focused: state.focused });
       return { pid, surfacePid, activity, displays, ...state };
@@ -193,10 +223,43 @@ export async function runBaseline({ env = process.env, root = 'artifacts/baselin
       await sleep(2000);
     }
     if (!accepted) throw new Error('Stable real launcher/SystemUI not observed');
-    store('hierarchy-command.txt', shell('uiautomator', 'dump', '/sdcard/anymize-os-baseline.xml'));
-    const xml = adb(['shell', 'cat', '/sdcard/anymize-os-baseline.xml']);
+    const uiPath = '/sdcard/anymize-os-baseline.xml', uiUntil = now() + 60000, attempts = [];
+    const uiAdb = (args) => {
+      const remaining = uiUntil - now();
+      if (remaining <= 0) throw new Error('Fresh UI evidence collection deadline exceeded');
+      return adb(args, Math.min(15000, remaining));
+    };
+    const uiShell = (...args) => uiAdb(['shell', ...args]).toString('utf8').trim();
+    const unchanged = () => {
+      const sample = capture(uiShell);
+      if (!sample.healthy || sample.pid !== previousPid || sample.surfacePid !== previousSurfacePid) throw new Error('Launcher/SystemUI/SurfaceFlinger changed during UI evidence capture');
+    };
+    let xml = null, lastCommand = '';
+    try {
+      for (let attempt = 1; attempt <= 6 && now() < uiUntil; attempt++) {
+        unchanged();
+        // A zero exit from uiautomator does not guarantee a file was written.
+        // Remove and independently require absence before every fresh attempt.
+        uiShell('rm', '-f', uiPath); uiShell('test', '!', '-e', uiPath);
+        let candidate = null, reason = 'fresh-dump-unavailable';
+        lastCommand = '';
+        try {
+          lastCommand = uiAdb(['shell', 'uiautomator', 'dump', uiPath]).toString('utf8').trim();
+          if (/^UI hier(?:archy|chary) dumped to: \/sdcard\/anymize-os-baseline\.xml$/.test(lastCommand)) {
+            const bytes = uiAdb(['shell', 'cat', uiPath]);
+            validateLauncherXml(new TextDecoder('utf-8', { fatal: true }).decode(bytes), homeComponent);
+            candidate = bytes; reason = 'fresh-complete-launcher-xml';
+          }
+        } catch { reason = 'fresh-dump-or-xml-rejected'; }
+        store(`hierarchy-command-${attempt}.txt`, lastCommand);
+        attempts.push({ attempt, at: new Date(now()).toISOString(), reason });
+        unchanged();
+        if (candidate) { xml = candidate; break; }
+        await sleep(Math.min(1000, Math.max(0, uiUntil - now())));
+      }
+    } finally { store('hierarchy-command.txt', lastCommand); store('hierarchy-attempts.json', JSON.stringify(attempts, null, 2)); }
+    if (!xml) throw new Error('No actual enabled launcher XML from fresh bounded dumps');
     store('launcher.xml', xml);
-    validateLauncherXml(xml.toString('utf8'), homeComponent);
     const png = adb(['exec-out', 'screencap', '-p']);
     validateScreenshot(png);
     store('launcher.png', png);
@@ -204,7 +267,8 @@ export async function runBaseline({ env = process.env, root = 'artifacts/baselin
     const system = shell('logcat', '-b', 'system', '-d', '-v', 'threadtime');
     store('events.txt', events);
     store('system.txt', system);
-    anrCheck(events, system);
+    const crash = shell('logcat', '-b', 'crash', '-d', '-v', 'threadtime'); store('crash.txt', crash);
+    anrCheck(events, system, crash);
     const finalSample = capture();
     if (!finalSample.healthy || finalSample.pid !== previousPid || finalSample.surfacePid !== previousSurfacePid) throw new Error('Launcher/SystemUI/SurfaceFlinger changed during UI evidence capture');
     store('final-display-focus.txt', finalSample.displays);

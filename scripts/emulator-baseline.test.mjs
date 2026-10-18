@@ -101,6 +101,17 @@ test('enabled XML must belong to the resolved launcher, not another node or inco
   for (const value of ['cat: no such file', xml.replace('</hierarchy>', ''), xml.replace('enabled="true"', 'enabled="false"'), xml.replace('com.google.android.apps.nexuslauncher', 'com.android.settings'), '<hierarchy><node package="com.google.android.apps.nexuslauncher" enabled="false"/><node package="com.android.settings" enabled="true"/></hierarchy>']) assert.throws(() => validateLauncherXml(value, HOME));
 });
 
+test('launcher XML requires a bounded well-formed complete document and valid attributes/entities', () => {
+  assert.doesNotThrow(() => validateLauncherXml(`<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation="0"><node package="com.google.android.apps.nexuslauncher" enabled="true"><node text="A &amp; B &#x1f600; &quot;quoted&quot;" /></node></hierarchy>`, HOME));
+  for (const value of [xml.replace('/></hierarchy>', '></hierarchy>'), xml.replace('enabled="true"', 'enabled="true" enabled="true"'),
+    xml + xml, '<!DOCTYPE hierarchy>' + xml, '<?xml version="2.0"?>' + xml, '<!-- comment -->' + xml,
+    xml.replace('clickable="true"', 'text="&unknown;"'), xml.replace('clickable="true"', 'text="&#0;"'),
+    xml.replace('clickable="true"', 'text="&#xD800;"'), xml.replace('clickable="true"', 'text="<raw"'),
+    xml.replace('clickable="true"', 'text="\ud800"'), xml.replace('clickable="true"', 'text="&amp"'),
+    xml.replace('enabled="true"', 'enabled="true"unexpected="x"'), xml.replace('<node', '<foreign'),
+    xml + 'trailing', ' '.repeat(2 * 1024 ** 2 + 1)]) assert.throws(() => validateLauncherXml(value, HOME));
+});
+
 test('text disguised as PNG, truncated headers and inadequate screen geometry are rejected', () => {
   assert.doesNotThrow(() => validateScreenshot(syntheticPng()));
   for (const bytes of [Buffer.from('screencap: failed to take screenshot'), Buffer.alloc(72), syntheticPng().subarray(0, 9999), Buffer.alloc(10001)]) assert.throws(() => validateScreenshot(bytes));
@@ -114,6 +125,7 @@ async function syntheticRun(api, override, check) {
   let clock = Date.parse('2026-10-18T20:00:00Z');
   let pidCalls = 0;
   let capturedScreen = false;
+  let uiFilePresent = false;
   const env = envFor(api);
   const root = join(directory, 'receipts');
   mkdirSync(join(directory, '.android', 'avd'), { recursive: true });
@@ -124,12 +136,12 @@ async function syntheticRun(api, override, check) {
     execute(command, args, settings) {
       assert.equal(command, 'adb');
       assert.deepEqual(args.slice(0, 2), ['-s', 'emulator-5554']);
-      assert.ok([15000, 20000].includes(settings.timeout));
+      assert.ok(Number.isSafeInteger(settings.timeout) && settings.timeout > 0 && settings.timeout <= 20000);
       const request = args.slice(2).join(' ');
       calls.push({ request });
       if (request === 'shell pidof com.android.systemui') pidCalls += 1;
       if (request === 'exec-out screencap -p') capturedScreen = true;
-      const changed = override?.({ request, pidCalls, capturedScreen, env, calls });
+      const changed = override?.({ request, pidCalls, capturedScreen, env, calls, settings, advance: (ms) => { clock += ms; } });
       if (changed !== undefined) return Buffer.isBuffer(changed) ? changed : Buffer.from(changed);
       let response;
       if (request === 'shell getprop ro.build.version.sdk') response = api;
@@ -144,8 +156,10 @@ async function syntheticRun(api, override, check) {
       else if (request.startsWith('shell logcat ')) response = 'I boot: healthy synthetic test';
       else if (request.startsWith('shell cmd package resolve-activity ')) response = SHORT_HOME;
       else if (request === 'shell input keyevent KEYCODE_HOME') response = '';
-      else if (request.startsWith('shell uiautomator dump ')) response = 'UI hierarchy dumped';
-      else if (request === 'shell cat /sdcard/anymize-os-baseline.xml') response = xml;
+      else if (request === 'shell rm -f /sdcard/anymize-os-baseline.xml') { uiFilePresent = false; response = ''; }
+      else if (request === 'shell test ! -e /sdcard/anymize-os-baseline.xml') { if (uiFilePresent) throw new Error('Stale test XML still exists'); response = ''; }
+      else if (request.startsWith('shell uiautomator dump ')) { uiFilePresent = true; response = 'UI hierchary dumped to: /sdcard/anymize-os-baseline.xml'; }
+      else if (request === 'shell cat /sdcard/anymize-os-baseline.xml') { if (!uiFilePresent) throw new Error('Fresh test XML absent'); response = xml; }
       else if (request === 'exec-out screencap -p') return syntheticPng();
       else if (request === 'shell getprop') response = '[ro.test.fixture]: [true]';
       else if (request === 'shell df -k /data /data/local/tmp') response = 'synthetic unit filesystem';
@@ -172,7 +186,7 @@ test('complete collector requires stable focus, emits receipts matching actual s
     assert.equal(result.pageSize, api === '35' ? '4096' : '16384');
     assert.equal(result.homeComponent, HOME);
     const observations = JSON.parse(readFileSync(join(root, 'observations.json'), 'utf8'));
-    assert.equal(observations.length, 5);
+    assert.equal(observations.length, 7);
     assert.ok(observations.every((sample) => sample.focused && sample.launcher && sample.pid === '1017' && sample.surfacePid === '1747'));
     for (const receipt of result.files) {
       const bytes = readFileSync(join(root, receipt.name));
@@ -186,6 +200,106 @@ test('complete collector requires stable focus, emits receipts matching actual s
     assert.ok(homeIndex >= 0 && focusIndex > homeIndex);
     assert.ok(calls.every((call) => !/logcat.* -c(?: |$)|force-stop|disable-user|setprop.*anr/.test(call.request ?? '')));
     assert.equal(existsSync(join(root, 'failure.json')), false);
+  });
+});
+
+test('empty/busy zero-exit dumps retry only fresh commands and accept genuine complete launcher XML', async () => {
+  let attempts = 0;
+  await syntheticRun('37', ({ request }) => request.startsWith('shell uiautomator dump ') && ++attempts <= 2
+    ? attempts === 1 ? '' : 'ERROR: could not get idle state.' : undefined, async ({ options, calls, root }) => {
+    const result = await runBaseline(options); assert.equal(result.status, 'passed'); assert.equal(attempts, 3);
+    assert.equal(calls.filter(({ request }) => request === 'shell cat /sdcard/anymize-os-baseline.xml').length, 1);
+    assert.equal(calls.filter(({ request }) => request === 'shell rm -f /sdcard/anymize-os-baseline.xml').length, 3);
+    assert.equal(calls.filter(({ request }) => request === 'shell test ! -e /sdcard/anymize-os-baseline.xml').length, 3);
+    assert.equal(readFileSync(join(root, 'hierarchy-command-1.txt'), 'utf8'), '');
+    assert.match(readFileSync(join(root, 'hierarchy-command-2.txt'), 'utf8'), /could not get idle/);
+    assert.equal(readFileSync(join(root, 'launcher.xml'), 'utf8'), xml);
+    assert.deepEqual(JSON.parse(readFileSync(join(root, 'hierarchy-attempts.json'), 'utf8')).map(({ reason }) => reason),
+      ['fresh-dump-unavailable', 'fresh-dump-unavailable', 'fresh-complete-launcher-xml']);
+    const requests = calls.map(({ request }) => request).filter(Boolean);
+    for (let index = 0; index < requests.length; index++) if (requests[index].startsWith('shell uiautomator dump ')) {
+      assert.equal(requests[index - 2], 'shell rm -f /sdcard/anymize-os-baseline.xml');
+      assert.equal(requests[index - 1], 'shell test ! -e /sdcard/anymize-os-baseline.xml');
+    }
+  });
+});
+
+test('a claimed successful dump without its file cannot accept cached XML and must generate a fresh replacement', async () => {
+  let reads = 0;
+  await syntheticRun('37', ({ request }) => { if (request === 'shell cat /sdcard/anymize-os-baseline.xml' && ++reads === 1) throw new Error('No such file or directory'); }, async ({ options, calls, root }) => {
+    assert.equal((await runBaseline(options)).status, 'passed'); assert.equal(reads, 2);
+    assert.equal(calls.filter(({ request }) => request === 'shell rm -f /sdcard/anymize-os-baseline.xml').length, 2);
+    assert.equal(JSON.parse(readFileSync(join(root, 'hierarchy-attempts.json'), 'utf8'))[0].reason, 'fresh-dump-or-xml-rejected');
+  });
+});
+
+test('stale XML is never read after a busy dump or a failed independent removal check', async () => {
+  for (const stale of [false, true]) await syntheticRun('37', ({ request }) => {
+    if (stale && request === 'shell test ! -e /sdcard/anymize-os-baseline.xml') throw new Error('Stale previous XML still exists');
+    if (request.startsWith('shell uiautomator dump ')) return '';
+    if (request === 'shell cat /sdcard/anymize-os-baseline.xml') return xml;
+  }, async ({ options, calls, root }) => {
+    await assert.rejects(runBaseline(options), stale ? /Stale previous XML/ : /fresh bounded dumps/);
+    assert.equal(calls.filter(({ request }) => request === 'shell cat /sdcard/anymize-os-baseline.xml').length, 0);
+    assert.equal(existsSync(join(root, 'launcher.xml')), false); assert.equal(existsSync(join(root, 'result.json')), false);
+    if (!stale) assert.equal(calls.filter(({ request }) => request?.startsWith('shell uiautomator dump ')).length, 6);
+  });
+});
+
+test('permanently malformed or foreign XML cannot satisfy bounded collection', async () => {
+  for (const invalid of [xml.replace('/></hierarchy>', '></hierarchy>'), xml.replace('enabled="true"', 'enabled="true" enabled="false"'), xml.replace('com.google.android.apps.nexuslauncher', 'com.android.settings'), Buffer.from([0xff, 0xfe, 0x3c])]) {
+    await syntheticRun('36', ({ request }) => request === 'shell cat /sdcard/anymize-os-baseline.xml' ? invalid : undefined, async ({ options, calls, root }) => {
+      await assert.rejects(runBaseline(options), /fresh bounded dumps/);
+      assert.equal(calls.filter(({ request }) => request?.startsWith('shell uiautomator dump ')).length, 6);
+      assert.equal(existsSync(join(root, 'result.json')), false);
+    });
+  }
+});
+
+test('any ANR or crash during a busy attempt fails immediately before a later valid dump', async () => {
+  for (const mode of ['events-anr', 'system-anr', 'events-crash', 'crash-buffer']) {
+    let dumped = false;
+    await syntheticRun('37', ({ request }) => {
+      if (request.startsWith('shell uiautomator dump ')) { dumped = true; return ''; }
+      if (dumped && mode === 'events-anr' && request.startsWith('shell logcat -b events')) return 'I am_anr: [0,1017,com.android.systemui]';
+      if (dumped && mode === 'system-anr' && request.startsWith('shell logcat -b system')) return 'ANR in com.google.android.apps.nexuslauncher';
+      if (dumped && mode === 'events-crash' && request.startsWith('shell logcat -b events')) return 'I am_crash: [0,1017,com.android.systemui]';
+      if (dumped && mode === 'crash-buffer' && request.startsWith('shell logcat -b crash')) return 'FATAL EXCEPTION: main';
+    }, async ({ options, calls, root }) => {
+      await assert.rejects(runBaseline(options), /Actual guest ANR|Actual guest crash/);
+      assert.equal(calls.filter(({ request }) => request?.startsWith('shell uiautomator dump ')).length, 1);
+      assert.equal(existsSync(join(root, 'result.json')), false);
+    });
+  }
+});
+
+test('any boot, foreground, SystemUI or SurfaceFlinger change during an attempt is fatal', async () => {
+  const failures = [['shell getprop sys.boot_completed', '0'], ['shell getprop init.svc.bootanim', 'running'],
+    ['shell pidof com.android.systemui', '2117'], ['shell pidof surfaceflinger', '2747'],
+    ['shell dumpsys window displays', displays.replaceAll('com.google.android.apps.nexuslauncher', 'com.android.settings')],
+    ['shell dumpsys activity activities', activity.replaceAll('com.google.android.apps.nexuslauncher', 'com.android.settings')]];
+  for (const [failing, value] of failures) {
+    let dumped = false;
+    await syntheticRun('35', ({ request }) => { if (request.startsWith('shell uiautomator dump ')) { dumped = true; return ''; } if (dumped && request === failing) return value; }, async ({ options, calls, root }) => {
+      await assert.rejects(runBaseline(options), /changed during UI evidence/);
+      assert.equal(calls.filter(({ request }) => request?.startsWith('shell uiautomator dump ')).length, 1);
+      assert.equal(existsSync(join(root, 'result.json')), false);
+    });
+  }
+});
+
+test('the shared collection deadline bounds every ADB call and cannot accept a late complete XML', async () => {
+  const timeouts = [];
+  await syntheticRun('37', ({ request, settings, advance }) => {
+    if (request.startsWith('shell uiautomator dump ')) { timeouts.push(settings.timeout); advance(settings.timeout); return ''; }
+  }, async ({ options, calls, root }) => {
+    await assert.rejects(runBaseline(options), /collection deadline exceeded/);
+    assert.deepEqual(timeouts, [15000, 15000, 15000, 12000]);
+    assert.equal(calls.filter(({ request }) => request === 'shell cat /sdcard/anymize-os-baseline.xml').length, 0);
+    assert.equal(existsSync(join(root, 'result.json')), false);
+  });
+  await syntheticRun('37', ({ request, advance }) => { if (request === 'shell cat /sdcard/anymize-os-baseline.xml') { advance(60001); return xml; } }, async ({ options, root }) => {
+    await assert.rejects(runBaseline(options), /collection deadline exceeded/); assert.equal(existsSync(join(root, 'result.json')), false);
   });
 });
 
