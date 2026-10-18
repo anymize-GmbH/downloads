@@ -1,0 +1,222 @@
+name: Build exact encrypted native preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact private Apps commit
+        required: true
+        type: string
+      input_asset_id:
+        description: Draft release encrypted source asset ID
+        required: true
+        type: string
+      metadata_asset_id:
+        description: Draft release nonsecret metadata asset ID
+        required: true
+        type: string
+      input_sha256:
+        description: Exact encrypted source SHA256
+        required: true
+        type: string
+      metadata_sha256:
+        description: Exact nonsecret metadata SHA256 including log recipient
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-preview-${{ inputs.source_commit }}
+  cancel-in-progress: false
+
+env:
+  CI: 'true'
+  ANYMIZE_EXPECTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
+  EXPO_NO_TELEMETRY: '1'
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+  CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+  ANYMIZE_DESKTOP_CHANNEL: preview
+
+jobs:
+  desktop:
+    name: Actual desktop ${{ matrix.id }} installer
+    if: github.repository == 'anymize-GmbH/downloads' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: win-x64, platform: win, arch: x64, runner: windows-2025 }
+          - { id: mac-x64, platform: mac, arch: x64, runner: macos-15-intel }
+          - { id: mac-arm64, platform: mac, arch: arm64, runner: macos-15 }
+          - { id: linux-x64, platform: linux, arch: x64, runner: ubuntu-24.04 }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.23.2'
+      - name: Authenticate encrypted exact source without repository credentials
+        run: node scripts/fetch-build-input.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_INPUT_ASSET_ID: ${{ inputs.input_asset_id }}
+          BUILD_INPUT_METADATA_ID: ${{ inputs.metadata_asset_id }}
+          BUILD_INPUT_SHA256: ${{ inputs.input_sha256 }}
+          BUILD_INPUT_METADATA_SHA256: ${{ inputs.metadata_sha256 }}
+          BUILD_INPUT_DECRYPTION_KEY: ${{ secrets.BUILD_INPUT_DECRYPTION_KEY }}
+      - name: Install immutable private source dependencies with no credentials
+        run: node scripts/run-private.mjs install
+      - name: Verify current application, local PDF, auth, and delivery controls
+        run: node scripts/run-private.mjs check
+      - name: Package and prepare actual native installer
+        run: node scripts/run-private.mjs package ${{ matrix.platform }} ${{ matrix.arch }}
+      - name: Enable supported Linux Chromium sandbox helper
+        if: runner.os == 'Linux'
+        run: node scripts/run-private.mjs sandbox
+      - name: Launch actual installed package and verify isolated local PDF and hosted shell
+        run: node scripts/run-private.mjs smoke ${{ matrix.platform }} ${{ matrix.arch }}
+      - name: Verify native installer hashes, integrity and smoke evidence
+        run: node scripts/run-private.mjs verify ${{ matrix.platform }} ${{ matrix.arch }}
+      - name: Uninstall disposable Windows test installation
+        if: always() && runner.os == 'Windows'
+        run: node scripts/run-private.mjs cleanup
+      - name: Preserve verified installable binaries and bounded synthetic evidence
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: anymize-desktop-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            private-input/source/artifacts/desktop/${{ matrix.id }}/*.exe
+            private-input/source/artifacts/desktop/${{ matrix.id }}/*.zip
+            private-input/source/artifacts/desktop/${{ matrix.id }}/*.dmg
+            private-input/source/artifacts/desktop/${{ matrix.id }}/*.AppImage
+            private-input/source/artifacts/desktop/${{ matrix.id }}/*.deb
+            private-input/source/artifacts/desktop/${{ matrix.id }}/manifest.json
+            private-input/source/artifacts/desktop/${{ matrix.id }}/SHA256SUMS.txt
+            private-input/source/artifacts/desktop/${{ matrix.id }}/smoke/*.json
+            private-input/source/artifacts/desktop/${{ matrix.id }}/smoke/*.png
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve encrypted failure diagnostics only
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-diagnostics-${{ matrix.id }}-${{ github.run_id }}
+          path: artifacts/encrypted-diagnostics/*.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  ios-simulator:
+    name: Actual iOS Release simulator build and launch
+    if: github.repository == 'anymize-GmbH/downloads' && github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      COCOAPODS_DISABLE_STATS: 'true'
+      RCT_NO_LAUNCH_PACKAGER: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.23.2'
+      - name: Authenticate encrypted exact source
+        run: node scripts/fetch-build-input.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_INPUT_ASSET_ID: ${{ inputs.input_asset_id }}
+          BUILD_INPUT_METADATA_ID: ${{ inputs.metadata_asset_id }}
+          BUILD_INPUT_SHA256: ${{ inputs.input_sha256 }}
+          BUILD_INPUT_METADATA_SHA256: ${{ inputs.metadata_sha256 }}
+          BUILD_INPUT_DECRYPTION_KEY: ${{ secrets.BUILD_INPUT_DECRYPTION_KEY }}
+      - run: node scripts/run-private.mjs install
+      - run: node scripts/run-private.mjs check
+      - name: Compile and integrity-seal simulator application
+        run: node scripts/run-private.mjs ios
+      - name: Install, launch and relaunch on real ephemeral iOS simulator
+        run: node scripts/run-private.mjs ios-smoke
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: success()
+        with:
+          name: preview-ios-simulator-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            private-input/source/artifacts/ios-simulator/*.tar.gz
+            private-input/source/artifacts/ios-simulator/build-info.json
+            private-input/source/artifacts/ios-simulator/SHA256SUMS
+            private-input/source/artifacts/ios-simulator-smoke/result.json
+            private-input/source/artifacts/ios-simulator-smoke/*.png
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: failure()
+        with:
+          name: encrypted-diagnostics-ios-${{ github.run_id }}
+          path: artifacts/encrypted-diagnostics/*.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  android:
+    name: Standalone Android APK
+    if: github.repository == 'anymize-GmbH/downloads' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.workers.max=3 -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.23.2'
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
+        with:
+          cmdline-tools-version: '15859902'
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+      - name: Install actual Expo Android toolchain
+        run: sdkmanager "platform-tools" "platforms;android-37.0" "build-tools;37.0.0" "ndk;27.1.12297006"
+      - name: Authenticate encrypted exact source
+        run: node scripts/fetch-build-input.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_INPUT_ASSET_ID: ${{ inputs.input_asset_id }}
+          BUILD_INPUT_METADATA_ID: ${{ inputs.metadata_asset_id }}
+          BUILD_INPUT_SHA256: ${{ inputs.input_sha256 }}
+          BUILD_INPUT_METADATA_SHA256: ${{ inputs.metadata_sha256 }}
+          BUILD_INPUT_DECRYPTION_KEY: ${{ secrets.BUILD_INPUT_DECRYPTION_KEY }}
+      - run: node scripts/run-private.mjs install
+      - run: node scripts/run-private.mjs check
+      - run: node scripts/run-private.mjs prebuild
+      - uses: gradle/actions/wrapper-validation@48b5f213c81028ace310571dc5ec0fbbca0b2947
+      - name: Build and verify debug-certificate signed sideload release
+        run: node scripts/run-private.mjs android
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: success()
+        with:
+          name: preview-android-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            private-input/source/artifacts/android-preview/*.apk
+            private-input/source/artifacts/android-preview/build-info.json
+            private-input/source/artifacts/android-preview/SHA256SUMS
+            private-input/source/artifacts/android-preview/apk-signature.txt
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: failure()
+        with:
+          name: encrypted-diagnostics-android-${{ github.run_id }}
+          path: artifacts/encrypted-diagnostics/*.json
+          if-no-files-found: warn
+          retention-days: 7

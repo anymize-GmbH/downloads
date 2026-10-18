@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.png binary
+*.exe binary
+*.dmg binary
+*.AppImage binary
+*.deb binary
+*.apk binary
+*.zip binary
+*.aesgcm binary

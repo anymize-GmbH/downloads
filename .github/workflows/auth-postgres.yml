@@ -1,0 +1,84 @@
+name: Verify exact private auth source against real PostgreSQL
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        required: true
+        type: string
+      input_asset_id:
+        required: true
+        type: string
+      metadata_asset_id:
+        required: true
+        type: string
+      input_sha256:
+        required: true
+        type: string
+      metadata_sha256:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  isolated-auth:
+    if: github.repository == 'anymize-GmbH/downloads' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    services:
+      postgres:
+        image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+        env:
+          POSTGRES_USER: native_fixture
+          POSTGRES_PASSWORD: isolated_disposable_fixture
+          POSTGRES_DB: native_fixture
+        ports:
+          - 127.0.0.1:5432:5432
+        options: --health-cmd "pg_isready -U native_fixture -d native_fixture" --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      CI: 'true'
+      NODE_OPTIONS: --max-old-space-size=8192
+      ANYMIZE_EXPECTED_SOURCE_REPOSITORY: attractsoft/anychat
+      ANYMIZE_EXPECTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
+      ANYMIZE_NATIVE_AUTH_TEST_DATABASE_URL: postgresql://native_fixture:isolated_disposable_fixture@127.0.0.1:5432/native_fixture
+      DATABASE_URL: postgresql://native_fixture:isolated_disposable_fixture@127.0.0.1:5432/native_fixture
+      FLORENTIN_SESSION_SECRET: fixture_native_auth_ci_not_a_production_secret_01234567890123456789
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.23.2'
+      - name: Authenticate exact encrypted private auth source
+        run: node scripts/fetch-build-input.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_INPUT_ASSET_ID: ${{ inputs.input_asset_id }}
+          BUILD_INPUT_METADATA_ID: ${{ inputs.metadata_asset_id }}
+          BUILD_INPUT_SHA256: ${{ inputs.input_sha256 }}
+          BUILD_INPUT_METADATA_SHA256: ${{ inputs.metadata_sha256 }}
+          BUILD_INPUT_DECRYPTION_KEY: ${{ secrets.AUTH_TEST_INPUT_KEY }}
+      - name: Install locked private dependencies without source credentials
+        run: node scripts/run-private.mjs install
+      - name: Verify browser flow, endpoint guards, logs and real concurrent one-time redemption
+        run: node scripts/run-private.mjs web-auth
+      - name: Preserve sanitized actual database acceptance receipt
+        run: node scripts/auth-test-receipt.mjs
+      - name: Generate actual Next route types and typecheck app and server
+        run: node scripts/run-private.mjs web-types
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: auth-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/auth-test/receipt.json
+          if-no-files-found: warn
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: failure()
+        with:
+          name: encrypted-diagnostics-auth-${{ github.run_id }}
+          path: artifacts/encrypted-diagnostics/*.json
+          if-no-files-found: warn
+          retention-days: 7
