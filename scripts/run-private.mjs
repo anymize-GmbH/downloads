@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { openSync, closeSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
+import { openSync, closeSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, lstatSync } from 'node:fs';
 import { createCipheriv, publicEncrypt, randomBytes, constants } from 'node:crypto';
 import { join, resolve } from 'node:path';
 
@@ -27,16 +27,42 @@ if (!Object.hasOwn(commands, phase) || platform && !['win', 'mac', 'linux'].incl
 const logPath = join(root, `.git/private-${phase}.log`);
 const descriptor = openSync(logPath, 'w', 0o600);
 let failed = false;
+const failures = [];
 const typeChecks = { app: 'not-run', server: 'not-run' };
+function appendAuthFailureResult() {
+  let reason = 'missing-or-unreadable';
+  try {
+    const path = join(root, '.git/private-auth-results.json');
+    const info = lstatSync(path);
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size <= 0 || info.size > 16 * 1024 ** 2) { reason = 'invalid-file-or-size'; }
+    else {
+      const bytes = readFileSync(path);
+      if (bytes.length !== info.size || bytes.length > 16 * 1024 ** 2) { reason = 'changed-or-oversized'; }
+      else {
+        const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+        if (value && typeof value === 'object' && Array.isArray(value.testResults) && typeof value.success === 'boolean' && Number.isSafeInteger(value.numFailedTests)) {
+          writeFileSync(descriptor, '\nPrivate actual test result JSON:\n');
+          writeFileSync(descriptor, bytes);
+          writeFileSync(descriptor, '\n');
+          return;
+        }
+        reason = 'invalid-report-shape';
+      }
+    }
+  } catch { /* Never serialize paths, source, parser input or an exception. */ }
+  writeFileSync(descriptor, `\nPrivate actual test result unavailable: ${reason}.\n`);
+}
 try {
   for (const [index, [program, args]] of commands[phase].entries()) {
     const result = spawnSync(program, args, { cwd: root, windowsHide: true, shell: process.platform === 'win32' && [npm, npx].includes(program), stdio: ['ignore', descriptor, descriptor], timeout: 2700000 });
     const passed = !result.error && result.status === 0;
     const independentTypecheck = phase === 'web-types' && index >= 2;
     if (independentTypecheck) typeChecks[index === 2 ? 'app' : 'server'] = passed ? 'passed' : 'failed';
-    if (!passed) { failed = true; if (!independentTypecheck) break; }
+    if (!passed) { failures.push({ command: index, exit: result.status, signal: result.signal ?? null, spawnError: Boolean(result.error) }); failed = true; if (!independentTypecheck) break; }
   }
   if (failed) {
+    writeFileSync(descriptor, `\nPrivate failed command statuses: ${JSON.stringify(failures)}\n`);
+    if (phase === 'web-auth') appendAuthFailureResult();
     writeFileSync(descriptor, '\nPrivate source Git status after phase failure:\n');
     const status = spawnSync('git', ['status', '--porcelain', '--untracked-files=all'], {
       cwd: root, windowsHide: true, stdio: ['ignore', descriptor, descriptor], timeout: 30000,
