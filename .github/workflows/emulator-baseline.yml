@@ -54,6 +54,10 @@ jobs:
           cmdline-tools-version: '15859902'
           packages: platform-tools emulator
           log-accepted-android-sdk-licenses: false
+      - name: Bind the pinned command tools used by the emulator action
+        # The action itself prepends cmdline-tools/latest, so adding the versioned
+        # tools to PATH alone still runs the preinstalled 12.0 avdmanager.
+        run: node scripts/emulator-baseline.mjs --pin-command-tools
       - name: Record actual host and enable disposable KVM access
         run: |
           mkdir -p artifacts/baseline

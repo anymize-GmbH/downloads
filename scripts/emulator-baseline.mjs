@@ -1,13 +1,49 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, lstatSync, realpathSync, renameSync, symlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { cpus, totalmem, homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const HOME_PACKAGES = new Set(['com.google.android.apps.nexuslauncher', 'com.android.launcher3']);
+const COMMAND_TOOLS_BUILD = '15859902';
+const COMMAND_TOOLS_REVISION = '22.0';
 const pause = (ms) => new Promise((done) => setTimeout(done, ms));
+
+export function pinCommandTools({ sdkRoot = process.env.ANDROID_HOME, artifactsRoot = 'artifacts/baseline' } = {}) {
+  if (typeof sdkRoot !== 'string' || !sdkRoot) throw new Error('Explicit actual SDK root required');
+  const sdk = realpathSync(sdkRoot);
+  const toolsRoot = realpathSync(join(sdk, 'cmdline-tools'));
+  const selected = realpathSync(join(toolsRoot, COMMAND_TOOLS_BUILD));
+  if (toolsRoot !== join(sdk, 'cmdline-tools') || selected !== join(toolsRoot, COMMAND_TOOLS_BUILD)) throw new Error('Pinned command tools must remain inside the actual SDK');
+  const properties = readFileSync(join(selected, 'source.properties'), 'utf8');
+  if (!new RegExp(`^Pkg\\.Revision[ \\t]*=[ \\t]*${COMMAND_TOOLS_REVISION.replace('.', '\\.')}[ \\t]*$`, 'm').test(properties.replaceAll('\r', ''))) throw new Error('Actual pinned command tools revision rejected');
+  const extension = process.platform === 'win32' ? '.bat' : '';
+  if (!existsSync(join(selected, 'bin', `sdkmanager${extension}`)) || !existsSync(join(selected, 'bin', `avdmanager${extension}`))) throw new Error('Actual command tools executables unavailable');
+  const latest = join(toolsRoot, 'latest');
+  const backup = join(toolsRoot, 'anymize-original-latest');
+  const entryExists = (path) => { try { lstatSync(path); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } };
+  let current = null;
+  try { current = realpathSync(latest); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  if (current !== selected) {
+    if (entryExists(backup)) throw new Error('Original tools backup must not be overwritten');
+    if (entryExists(latest)) renameSync(latest, backup);
+    symlinkSync(selected, latest, process.platform === 'win32' ? 'junction' : 'dir');
+  }
+  if (realpathSync(latest) !== selected) throw new Error('Emulator action tools alias was not pinned');
+  mkdirSync(artifactsRoot, { recursive: true });
+  writeFileSync(join(artifactsRoot, 'command-line-tools.properties'), properties);
+  const receipt = { build: COMMAND_TOOLS_BUILD, revision: COMMAND_TOOLS_REVISION, selected, actualLatestTarget: realpathSync(latest), priorToolsPreserved: entryExists(backup) };
+  writeFileSync(join(artifactsRoot, 'command-line-tools.json'), JSON.stringify(receipt, null, 2));
+  return receipt;
+}
+
+export function validateAvdTarget(contents, api) {
+  const targets = [...contents.matchAll(/^target[ \t]*=[ \t]*([^\r\n]+)$/gm)];
+  const expected = `android-${api === '37' ? '37.0' : api}`;
+  if (targets.length !== 1 || targets[0][1].trim() !== expected) throw new Error('Actual AVD target does not match its complete system image');
+}
 
 export function validateExpectedIdentity(env) {
   const api = env.EXPECTED_API;
@@ -29,7 +65,7 @@ export function assertNoAnr(events, system = '') {
   if (/\bam_anr\b/.test(events) || /\bANR in\s+/.test(system)) throw new Error('Actual guest ANR observed');
 }
 
-export function assessBootSample({ boot, animation, pid, activity, displays, homeComponent }) {
+export function assessBootSample({ boot, animation, pid, surfacePid, activity, displays, homeComponent }) {
   const displaySections = [...displays.matchAll(/^\s*Display: mDisplayId=(\d+)\b[^\n]*\n/gm)];
   const zero = displaySections.filter((match) => match[1] === '0');
   let displayZero = '';
@@ -45,7 +81,7 @@ export function assessBootSample({ boot, animation, pid, activity, displays, hom
   // A window-list dump has background launcher names but no actual display
   // focus. Both display-zero focus fields must name the resolved HOME activity.
   const focused = fieldMatches('mCurrentFocus') && fieldMatches('mFocusedApp');
-  const healthy = boot === '1' && animation === 'stopped' && /^[1-9]\d*$/.test(pid) && launcher && focused;
+  const healthy = boot === '1' && animation === 'stopped' && /^[1-9]\d*$/.test(pid) && /^[1-9]\d*$/.test(surfacePid) && launcher && focused;
   return { launcher, focused, healthy };
 }
 
@@ -89,6 +125,9 @@ export async function runBaseline({ env = process.env, root = 'artifacts/baselin
     store('guest-memory.txt', shell('cat', '/proc/meminfo'));
     store('guest-display-size.txt', shell('wm', 'size'));
     store('guest-display-density.txt', shell('wm', 'density'));
+    const avdTarget = readFileSync(join(home, '.android', 'avd', 'test.ini'), 'utf8');
+    store('avd-target.ini.txt', avdTarget);
+    validateAvdTarget(avdTarget, api);
     for (const name of ['config.ini', 'hardware-qemu.ini']) {
       const path = join(home, '.android', 'avd', 'test.avd', name);
       if (existsSync(path)) store(`avd-${name}.txt`, readFileSync(path));
@@ -106,25 +145,28 @@ export async function runBaseline({ env = process.env, root = 'artifacts/baselin
     store('home-command.txt', shell('input', 'keyevent', 'KEYCODE_HOME'));
     let stable = 0;
     let previousPid = '';
+    let previousSurfacePid = '';
     let accepted = false;
     const until = now() + 180000;
     const capture = () => {
       const boot = shell('getprop', 'sys.boot_completed');
       const animation = shell('getprop', 'init.svc.bootanim');
       const pid = shell('pidof', 'com.android.systemui');
+      const surfacePid = shell('pidof', 'surfaceflinger');
       const activity = shell('dumpsys', 'activity', 'activities');
       // AOSP's "windows" subcommand omits DisplayContent's focus fields.
       const displays = shell('dumpsys', 'window', 'displays');
       const events = shell('logcat', '-b', 'events', '-d', '-v', 'threadtime');
       anrCheck(events);
-      const state = assessBootSample({ boot, animation, pid, activity, displays, homeComponent });
-      observations.push({ at: new Date(now()).toISOString(), boot, animation, pid, launcher: state.launcher, focused: state.focused });
-      return { pid, activity, displays, ...state };
+      const state = assessBootSample({ boot, animation, pid, surfacePid, activity, displays, homeComponent });
+      observations.push({ at: new Date(now()).toISOString(), boot, animation, pid, surfacePid, launcher: state.launcher, focused: state.focused });
+      return { pid, surfacePid, activity, displays, ...state };
     };
     while (now() < until) {
       const sample = capture();
-      stable = sample.healthy && sample.pid === previousPid ? stable + 1 : 0;
+      stable = sample.healthy && sample.pid === previousPid && sample.surfacePid === previousSurfacePid ? stable + 1 : 0;
       previousPid = sample.pid;
+      previousSurfacePid = sample.surfacePid;
       if (stable >= 3) {
         store('activities.txt', sample.activity);
         store('display-focus.txt', sample.displays);
@@ -148,7 +190,7 @@ export async function runBaseline({ env = process.env, root = 'artifacts/baselin
     store('system.txt', system);
     anrCheck(events, system);
     const finalSample = capture();
-    if (!finalSample.healthy || finalSample.pid !== previousPid) throw new Error('Launcher/SystemUI changed during UI evidence capture');
+    if (!finalSample.healthy || finalSample.pid !== previousPid || finalSample.surfacePid !== previousSurfacePid) throw new Error('Launcher/SystemUI/SurfaceFlinger changed during UI evidence capture');
     store('final-display-focus.txt', finalSample.displays);
     store('final-activities.txt', finalSample.activity);
     store('observations.json', JSON.stringify(observations, null, 2));
@@ -166,4 +208,10 @@ export async function runBaseline({ env = process.env, root = 'artifacts/baselin
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await runBaseline();
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (process.argv.length === 3 && process.argv[2] === '--pin-command-tools') {
+    const tools = pinCommandTools();
+    process.stdout.write(`Actual command-line tools ${tools.revision} bound to emulator action latest path.\n`);
+  } else if (process.argv.length === 2) await runBaseline();
+  else throw new Error('Unsupported OS baseline command');
+}

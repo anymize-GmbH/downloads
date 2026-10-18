@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test } from 'node:test';
-import { validateExpectedIdentity, parseHomeComponent, assessBootSample, assertNoAnr, validateLauncherXml, validateScreenshot, runBaseline } from './emulator-baseline.mjs';
+import { pinCommandTools, validateAvdTarget, validateExpectedIdentity, parseHomeComponent, assessBootSample, assertNoAnr, validateLauncherXml, validateScreenshot, runBaseline } from './emulator-baseline.mjs';
 
 const HOME = 'com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity';
 const SHORT_HOME = 'com.google.android.apps.nexuslauncher/.NexusLauncherActivity';
@@ -24,12 +24,44 @@ function syntheticPng() {
   bytes.writeUInt32BE(1280, 20);
   return bytes;
 }
-const good = (overrides = {}) => ({ boot: '1', animation: 'stopped', pid: '1017', activity, displays, homeComponent: HOME, ...overrides });
+const good = (overrides = {}) => ({ boot: '1', animation: 'stopped', pid: '1017', surfacePid: '1747', activity, displays, homeComponent: HOME, ...overrides });
 const envFor = (api) => ({ EXPECTED_API: api, EXPECTED_PAGE_SIZE: api === '35' ? '4096' : '16384', EXPECTED_IMAGE: api === '35' ? 'google_apis' : 'google_apis_ps16k', GITHUB_REPOSITORY: 'test-only/not-real-ci', GITHUB_SHA: 'a'.repeat(40), GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '1' });
 
 test('exact API/image/page combinations are required for every matrix entry', () => {
   for (const api of ['35', '36', '37']) assert.equal(validateExpectedIdentity(envFor(api)).api, api);
   for (const patch of [{ EXPECTED_API: '34' }, { EXPECTED_PAGE_SIZE: '4096' }, { EXPECTED_IMAGE: 'google_apis' }, { EXPECTED_API: undefined }, { EXPECTED_PAGE_SIZE: '16384\n' }]) assert.throws(() => validateExpectedIdentity({ ...envFor('37'), ...patch }));
+});
+
+test('the action latest alias points to the actual pinned tools and preserves the old SDK tools', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'anymize-tools-alias-test-'));
+  try {
+    const selected = join(directory, 'cmdline-tools', '15859902');
+    const latest = join(directory, 'cmdline-tools', 'latest');
+    mkdirSync(join(selected, 'bin'), { recursive: true });
+    mkdirSync(latest);
+    writeFileSync(join(selected, 'source.properties'), 'Pkg.Revision=22.0\r\n');
+    writeFileSync(join(latest, 'source.properties'), 'Pkg.Revision=12.0\n');
+    const extension = process.platform === 'win32' ? '.bat' : '';
+    for (const executable of ['sdkmanager', 'avdmanager']) writeFileSync(join(selected, 'bin', executable + extension), 'test only, never executed');
+    const artifactsRoot = join(directory, 'receipts');
+    const result = pinCommandTools({ sdkRoot: directory, artifactsRoot });
+    assert.equal(result.revision, '22.0');
+    assert.equal(realpathSync(latest), realpathSync(selected));
+    assert.equal(readFileSync(join(directory, 'cmdline-tools', 'anymize-original-latest', 'source.properties'), 'utf8'), 'Pkg.Revision=12.0\n');
+    assert.equal(JSON.parse(readFileSync(join(artifactsRoot, 'command-line-tools.json'), 'utf8')).actualLatestTarget, realpathSync(selected));
+    assert.equal(pinCommandTools({ sdkRoot: directory, artifactsRoot }).actualLatestTarget, realpathSync(selected));
+    writeFileSync(join(selected, 'source.properties'), 'Pkg.Revision=12.0\n');
+    assert.throws(() => pinCommandTools({ sdkRoot: directory, artifactsRoot }), /revision rejected/);
+  } finally {
+    if (!directory.startsWith(join(tmpdir(), 'anymize-tools-alias-test-'))) throw new Error('Unexpected tools test temporary directory');
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('actual AVD targets reject the known android-0 minor-version parsing failure', () => {
+  for (const api of ['35', '36', '37']) assert.doesNotThrow(() => validateAvdTarget(`avd.ini.encoding=UTF-8\r\ntarget=android-${api === '37' ? '37.0' : api}\r\n`, api));
+  assert.doesNotThrow(() => validateAvdTarget('target\t=\tandroid-37.0\n', '37'));
+  for (const value of ['target=android-0\n', 'target=android-37\n', 'target=android-36\n', '', 'target=android-37.0\ntarget=android-37.0\n']) assert.throws(() => validateAvdTarget(value, '37'));
 });
 
 test('default HOME is resolved exactly and aliases normalize without accepting arbitrary packages', () => {
@@ -54,7 +86,7 @@ test('launcher on another display and stale background launcher strings do not c
 });
 
 test('boot, animation and a single live SystemUI PID remain hard conditions', () => {
-  for (const patch of [{ boot: '0' }, { boot: '' }, { animation: 'running' }, { pid: '' }, { pid: '1017 2117' }, { pid: '0' }, { pid: 'dead' }]) assert.equal(assessBootSample(good(patch)).healthy, false);
+  for (const patch of [{ boot: '0' }, { boot: '' }, { animation: 'running' }, { pid: '' }, { pid: '1017 2117' }, { pid: '0' }, { pid: 'dead' }, { surfacePid: '' }, { surfacePid: '1747 2747' }]) assert.equal(assessBootSample(good(patch)).healthy, false);
 });
 
 test('actual API 37 launcher and SystemUI ANR signatures remain fatal', () => {
@@ -84,6 +116,8 @@ async function syntheticRun(api, override, check) {
   let capturedScreen = false;
   const env = envFor(api);
   const root = join(directory, 'receipts');
+  mkdirSync(join(directory, '.android', 'avd'), { recursive: true });
+  writeFileSync(join(directory, '.android', 'avd', 'test.ini'), `target=android-${api === '37' ? '37.0' : api}\n`);
   const options = {
     env, root, home: directory, host: { cpus: 4, bytes: 16 * 1024 ** 3 }, now: () => clock,
     sleep: async (ms) => { clock += ms; }, output: (line) => calls.push({ output: line }),
@@ -103,6 +137,7 @@ async function syntheticRun(api, override, check) {
       else if (request === 'shell getprop sys.boot_completed') response = '1';
       else if (request === 'shell getprop init.svc.bootanim') response = 'stopped';
       else if (request === 'shell pidof com.android.systemui') response = '1017';
+      else if (request === 'shell pidof surfaceflinger') response = '1747';
       else if (request === 'shell dumpsys activity activities') response = activity;
       else if (request === 'shell dumpsys window displays') response = displays;
       else if (request === 'shell dumpsys window windows') response = windowsOnly;
@@ -138,7 +173,7 @@ test('complete collector requires stable focus, emits receipts matching actual s
     assert.equal(result.homeComponent, HOME);
     const observations = JSON.parse(readFileSync(join(root, 'observations.json'), 'utf8'));
     assert.equal(observations.length, 5);
-    assert.ok(observations.every((sample) => sample.focused && sample.launcher && sample.pid === '1017'));
+    assert.ok(observations.every((sample) => sample.focused && sample.launcher && sample.pid === '1017' && sample.surfacePid === '1747'));
     for (const receipt of result.files) {
       const bytes = readFileSync(join(root, receipt.name));
       assert.equal(bytes.length, receipt.bytes);
@@ -195,6 +230,13 @@ test('SystemUI replacement during UI evidence capture is rejected', async () => 
   });
 });
 
+test('SurfaceFlinger replacement during UI evidence capture is also rejected', async () => {
+  await syntheticRun('37', ({ request, capturedScreen }) => request === 'shell pidof surfaceflinger' && capturedScreen ? '2747' : undefined, async ({ options, root }) => {
+    await assert.rejects(runBaseline(options), /changed during UI evidence/);
+    assert.equal(existsSync(join(root, 'result.json')), false);
+  });
+});
+
 test('failed XML or failed screencap cannot be converted into launcher acceptance', async () => {
   for (const requestToBreak of ['shell cat /sdcard/anymize-os-baseline.xml', 'exec-out screencap -p']) await syntheticRun('36', ({ request }) => request === requestToBreak ? 'actual command returned an error' : undefined, async ({ options, root }) => {
     await assert.rejects(runBaseline(options), /No actual enabled launcher XML|Invalid actual screen pixels/);
@@ -230,5 +272,7 @@ test('workflow preserves full official images, acceleration, page-size identity 
   assert.match(workflow, /-no-boot-anim/);
   assert.match(workflow, /-skin 720x1280 -dpi-device 320/);
   assert.match(workflow, /node --test scripts\/emulator-baseline\.test\.mjs/);
+  assert.match(workflow, /node scripts\/emulator-baseline\.mjs --pin-command-tools/);
+  assert.ok(workflow.indexOf('node scripts/emulator-baseline.mjs --pin-command-tools') < workflow.indexOf('uses: reactivecircus/android-emulator-runner@'));
   assert.doesNotMatch(workflow, /continue-on-error: true|disable-animations: true|logcat[^\n]* -c/);
 });
